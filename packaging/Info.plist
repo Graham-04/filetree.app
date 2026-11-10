@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key>
+	<string>Filetree</string>
+	<key>CFBundleDisplayName</key>
+	<string>Filetree</string>
+	<key>CFBundleIdentifier</key>
+	<string>local.filetree</string>
+	<key>CFBundleIconFile</key>
+	<string>Filetree</string>
+	<key>CFBundleIconName</key>
+	<string>Filetree</string>
+	<key>CFBundleExecutable</key>
+	<string>filetree</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>__VERSION__</string>
+	<key>CFBundleVersion</key>
+	<string>__VERSION__</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>11.0</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.productivity</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSDesktopFolderUsageDescription</key>
+	<string>Filetree shows and searches the files on your Desktop.</string>
+	<key>NSDocumentsFolderUsageDescription</key>
+	<string>Filetree shows and searches the files in your Documents folder.</string>
+	<key>NSDownloadsFolderUsageDescription</key>
+	<string>Filetree shows and searches the files in your Downloads folder.</string>
+	<key>NSRemovableVolumesUsageDescription</key>
+	<string>Filetree shows the files on external drives you open.</string>
+	<key>NSNetworkVolumesUsageDescription</key>
+	<string>Filetree shows the files on network drives you open.</string>
+</dict>
+</plist>
