@@ -89,7 +89,15 @@ pub(super) fn render(usage: Option<&IndexUsage>, settings: &UserSettings) -> imp
                                 .child("Settings"),
                         )
                         .child(section("General", files(settings)))
-                        .child(section("Storage", index_storage(usage))),
+                        .child(section("Storage", index_storage(usage)))
+                        .child(
+                            div()
+                                .flex()
+                                .justify_center()
+                                .text_size(dp(text_size::DETAIL))
+                                .text_color(rgb(0x808080))
+                                .child(concat!("Filetree ", env!("CARGO_PKG_VERSION"))),
+                        ),
                 )
                 // The panel's corner, not the column's.
                 .child(

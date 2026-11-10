@@ -7,8 +7,9 @@
 #
 # Rust embeds source paths in the binary for error messages, including every
 # dependency under ~/.cargo and the toolchain under ~/.rustup. They are
-# rewritten to start with "~" so the app never contains the builder's home
-# folder or username, and the build fails if one slips through. The bundle
+# rewritten to start with "~", and the project's own to be relative to it, so
+# the app never contains the builder's home folder, username, or where they
+# keep the project; the build fails if the home folder slips through. The bundle
 # builds in its own target folder, so these flags do not force everyday
 # builds to recompile.
 #
@@ -19,7 +20,7 @@ set -eu
 cd "$(dirname "$0")/.."
 bundle_id="${BUNDLE_ID:-$(plutil -extract CFBundleIdentifier raw -o - packaging/Info.plist)}"
 
-export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$HOME=~"
+export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$HOME=~ --remap-path-prefix=$PWD=."
 export CARGO_TARGET_DIR=target/bundle
 cargo build --release
 binary="$CARGO_TARGET_DIR/release/filetree"

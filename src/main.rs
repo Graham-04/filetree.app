@@ -8,8 +8,8 @@ use std::{
 use futures::StreamExt as _;
 use gpui::{
     App, Application, Bounds, Context, Entity, ExternalPaths, FocusHandle, Focusable, IntoElement,
-    KeyBinding, MouseButton, Render, ScrollHandle, SharedString, TitlebarOptions, Window,
-    WindowBounds, WindowOptions, actions, div, prelude::*, px, rgb, size,
+    KeyBinding, MouseButton, PromptLevel, Render, ScrollHandle, SharedString, TitlebarOptions,
+    Window, WindowBounds, WindowOptions, actions, div, prelude::*, px, rgb, size,
 };
 
 mod drag_out;
@@ -60,6 +60,7 @@ actions!(
         ToggleSettings,
         ToggleHiddenFiles,
         ToggleSounds,
+        CheckForUpdates,
         ArrowKeysHistory,
         ArrowKeysFolderPath,
         GoLeft,
@@ -152,6 +153,7 @@ enum Command {
     Settings,
     HiddenFiles,
     Sounds,
+    CheckForUpdates,
     ArrowsHistory,
     ArrowsFolderPath,
     ResetZoom,
@@ -163,6 +165,7 @@ impl Command {
             Self::Settings => "Settings",
             Self::HiddenFiles => "Show Hidden Files",
             Self::Sounds => "Play Sounds",
+            Self::CheckForUpdates => "Check for Updates",
             Self::ArrowsHistory => "⌘← ⌘→ Go Back and Forward",
             Self::ArrowsFolderPath => "⌘← ⌘→ Move Along the Folder Path",
             Self::ResetZoom => "Reset to Default Zoom",
@@ -173,7 +176,7 @@ impl Command {
         match self {
             Self::Settings => Some("⌘,"),
             Self::HiddenFiles => Some("⌘⇧."),
-            Self::Sounds => None,
+            Self::Sounds | Self::CheckForUpdates => None,
             Self::ArrowsHistory | Self::ArrowsFolderPath => None,
             Self::ResetZoom => Some("⌘0"),
             Self::ClearIndex => None,
@@ -184,6 +187,7 @@ impl Command {
             Self::Settings => "gearshape",
             Self::HiddenFiles => "eye",
             Self::Sounds => "speaker.wave.2",
+            Self::CheckForUpdates => "arrow.down.circle",
             Self::ArrowsHistory => "clock.arrow.circlepath",
             Self::ArrowsFolderPath => "arrow.up.and.down.text.horizontal",
             Self::ResetZoom => "arrow.counterclockwise",
@@ -195,6 +199,7 @@ impl Command {
             Self::Settings => Box::new(ToggleSettings),
             Self::HiddenFiles => Box::new(ToggleHiddenFiles),
             Self::Sounds => Box::new(ToggleSounds),
+            Self::CheckForUpdates => Box::new(CheckForUpdates),
             Self::ArrowsHistory => Box::new(ArrowKeysHistory),
             Self::ArrowsFolderPath => Box::new(ArrowKeysFolderPath),
             Self::ResetZoom => Box::new(ResetZoom),
@@ -208,22 +213,27 @@ enum MenuItem {
     Path(path_completion::Completion),
 }
 
-fn matching_commands(query: &str) -> Vec<Command> {
+/// The commands matching `query`; Check for Updates only in builds that
+/// update themselves.
+fn matching_commands(query: &str, updates: bool) -> Vec<Command> {
     [
         Command::Settings,
         Command::HiddenFiles,
         Command::Sounds,
+        Command::CheckForUpdates,
         Command::ArrowsHistory,
         Command::ArrowsFolderPath,
         Command::ResetZoom,
         Command::ClearIndex,
     ]
     .into_iter()
+    .filter(|command| updates || !matches!(command, Command::CheckForUpdates))
     .filter(|command| {
         let haystack = match command {
             Command::Settings => "settings preferences storage file index size disk",
             Command::HiddenFiles => "show hidden files dotfiles dot files invisible toggle",
             Command::Sounds => "play sounds sound effects audio mute volume toggle",
+            Command::CheckForUpdates => "check for updates update upgrade new version release",
             Command::ArrowsHistory => "arrow keys left right back forward history navigation",
             Command::ArrowsFolderPath => {
                 "arrow keys left right folder path parent up down navigation"
@@ -281,7 +291,10 @@ struct FileBrowser {
     context_menu: Option<ContextMenu>,
     /// A newer release on the titlebar's Update button, and its install.
     update: Option<UpdateState>,
+    /// Whether this is an official build that updates itself.
+    updates_supported: bool,
     _update_checks: Option<gpui::Task<()>>,
+    _update_check_now: Option<gpui::Task<()>>,
     _update_install: Option<gpui::Task<()>>,
     /// The path bar's text field, shown while typing a path.
     path_input: Entity<search_input::SearchInput>,
@@ -435,7 +448,9 @@ impl FileBrowser {
             command_menu_open: false,
             context_menu: None,
             update: None,
+            updates_supported: false,
             _update_checks: None,
+            _update_check_now: None,
             _update_install: None,
             path_input,
             path_edit: None,
@@ -706,11 +721,17 @@ impl FileBrowser {
             if !worker.spawn(async { updater::supported() }).await {
                 return;
             }
+            if this
+                .update(cx, |this, _| this.updates_supported = true)
+                .is_err()
+            {
+                return;
+            }
             loop {
                 match worker.spawn(async { updater::check() }).await {
                     Ok(release) => {
                         let offered = this.update(cx, |this, cx| {
-                            // A download in progress keeps the build it started.
+                            // A download or a check in progress keeps its state.
                             if matches!(this.update, None | Some(UpdateState::Available(_))) {
                                 this.update = release.map(UpdateState::Available);
                                 cx.notify();
@@ -724,6 +745,53 @@ impl FileBrowser {
                 }
                 worker.timer(updater::CHECK_EVERY).await;
             }
+        }));
+    }
+
+    /// Looks for a new release now, as asked from the command menu: a
+    /// spinner in the Update button's place while it looks, then the button
+    /// if there is a newer release, or an alert saying there is none.
+    fn check_for_updates(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.updates_supported || self.update.is_some() {
+            return;
+        }
+        self.update = Some(UpdateState::Checking(Instant::now()));
+        cx.notify();
+        let worker = cx.background_executor().clone();
+        self._update_check_now = Some(cx.spawn_in(window, async move |this, cx| {
+            let result = worker.spawn(async { updater::check() }).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                if !matches!(this.update, Some(UpdateState::Checking(_))) {
+                    return;
+                }
+                this.update = None;
+                cx.notify();
+                let (level, message, detail) = match result {
+                    Ok(Some(release)) => {
+                        this.update = Some(UpdateState::Available(release));
+                        return;
+                    }
+                    Ok(None) => (
+                        PromptLevel::Info,
+                        "You’re up to date",
+                        concat!(
+                            "Filetree ",
+                            env!("CARGO_PKG_VERSION"),
+                            " is the latest version."
+                        ),
+                    ),
+                    Err(error) => {
+                        eprintln!("Update check failed: {error:#}");
+                        (
+                            PromptLevel::Warning,
+                            "Couldn’t check for updates",
+                            "Check your internet connection and try again.",
+                        )
+                    }
+                };
+                // Only OK to press; nothing waits on the answer.
+                drop(window.prompt(level, message, Some(detail), &["OK"], cx));
+            });
         }));
     }
 
@@ -2193,7 +2261,11 @@ impl FileBrowser {
             None => path_completion::matching_recent(query, &self.menu_recent)
                 .into_iter()
                 .map(MenuItem::Path)
-                .chain(matching_commands(query).into_iter().map(MenuItem::Command))
+                .chain(
+                    matching_commands(query, self.updates_supported)
+                        .into_iter()
+                        .map(MenuItem::Command),
+                )
                 .collect(),
         }
     }
@@ -2779,6 +2851,11 @@ impl Render for FileBrowser {
                 this.selected_command = (this.selected_command + 1).min(count.saturating_sub(1));
                 cx.notify();
             }))
+            .on_action(cx.listener(|this, _: &CheckForUpdates, window, cx| {
+                this.command_menu_open = false;
+                this.focus_list(window, cx);
+                this.check_for_updates(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &ClearFileIndex, window, cx| {
                 this.command_menu_open = false;
                 this.focus_list(window, cx);
@@ -3035,15 +3112,18 @@ impl Render for FileBrowser {
                             .items_center()
                             .justify_center()
                             .gap(dp(4.))
-                            .relative()
                             .overflow_hidden()
                             .rounded(dp(radius::SM))
                             .text_size(dp(text_size::DETAIL))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(rgb(0xffffff))
-                            .map(|button| match progress {
+                            .map(|button| match (&self.update, progress) {
+                                // Checking: a spinner beside the sidebar toggle.
+                                (Some(UpdateState::Checking(started)), _) => {
+                                    button.justify_end().child(ui::spinner(*started, 14.))
+                                }
                                 // Offered: a solid accent button.
-                                None => button
+                                (_, None) => button
                                     .bg(rgb(0x0a84ff))
                                     .hover(|button| button.bg(rgb(0x2a94ff)))
                                     .cursor_pointer()
@@ -3055,7 +3135,7 @@ impl Render for FileBrowser {
                                     .child("Update"),
                                 // Installing: the accent fills the button as the
                                 // download arrives, behind the label.
-                                Some(fraction) => button
+                                (_, Some(fraction)) => button
                                     .bg(rgb(0x1d3a5c))
                                     .child(
                                         div()
@@ -3195,6 +3275,9 @@ enum UpdateState {
     Downloading(f32),
     /// Verifying and swapping in the new build, then restarting.
     Installing,
+    /// Looking for a release because the user asked, since the instant
+    /// given (the spinner's start).
+    Checking(Instant),
 }
 
 /// Typing a path in the path bar.

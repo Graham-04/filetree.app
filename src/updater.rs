@@ -26,7 +26,7 @@ const REPOSITORY: Option<&str> = option_env!("FILETREE_UPDATE_REPOSITORY");
 const TEAM: Option<&str> = option_env!("FILETREE_RELEASE_TEAM");
 
 /// How often a running app looks for a new release, after launch.
-pub(super) const CHECK_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
+pub(super) const CHECK_EVERY: Duration = Duration::from_secs(3 * 60 * 60);
 
 /// A newer release to install.
 #[derive(Clone, Debug, PartialEq)]

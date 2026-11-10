@@ -128,6 +128,39 @@ pub(super) fn checkbox(checked: bool) -> gpui::Div {
         })
 }
 
+/// A spinning three-quarter ring, `size` points across, turning from
+/// `started`. It animates in the presented frame alone, so the view around it
+/// never repaints.
+pub(super) fn spinner(started: Instant, size: f32) -> impl gpui::IntoElement {
+    use gpui::{PathBuilder, canvas, point, prelude::*, rgb};
+    const TURN: Duration = Duration::from_millis(800);
+    canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            let width = dp(1.5).to_pixels(window.rem_size());
+            let center = bounds.center();
+            let radius = bounds.size.width.min(bounds.size.height) / 2. - width;
+            window.paint_animated_path(bounds, move |now| {
+                let turned =
+                    now.saturating_duration_since(started).as_secs_f32() / TURN.as_secs_f32();
+                let start = turned.fract() * std::f32::consts::TAU;
+                let end = start + std::f32::consts::TAU * 0.75;
+                let at = |angle: f32| {
+                    point(
+                        center.x + radius * angle.cos(),
+                        center.y + radius * angle.sin(),
+                    )
+                };
+                let mut path = PathBuilder::stroke(width);
+                path.move_to(at(start));
+                path.arc_to(point(radius, radius), px(0.), true, true, at(end));
+                Some((path.build().ok()?, rgb(0xaaaaaa).into()))
+            });
+        },
+    )
+    .size(dp(size))
+}
+
 /// Builds a tooltip showing `text`, for `StatefulInteractiveElement::tooltip`.
 pub(super) fn tooltip(
     text: &'static str,
