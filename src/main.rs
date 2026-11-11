@@ -3150,6 +3150,13 @@ impl Render for FileBrowser {
                                             .bottom_0()
                                             .left_0()
                                             .w(gpui::relative(fraction.clamp(0., 1.)))
+                                            // Clipping is square, so the fill
+                                            // carries the button's corners: the
+                                            // left always, the right once full.
+                                            .rounded_l(dp(radius::SM))
+                                            .when(fraction >= 1., |fill| {
+                                                fill.rounded_r(dp(radius::SM))
+                                            })
                                             .bg(rgb(0x0a84ff)),
                                     )
                                     .child(div().relative().child(if fraction >= 1. {
