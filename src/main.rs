@@ -1955,6 +1955,12 @@ impl FileBrowser {
                                             .flex_shrink_0()
                                             .font_weight(gpui::FontWeight::MEDIUM)
                                     })
+                                    // Short of room, the dimmed folders ahead
+                                    // give way before the path that leads here.
+                                    .when(index > last, |mut segment| {
+                                        segment.style().flex_shrink = Some(8.);
+                                        segment
+                                    })
                                     .cursor_pointer()
                                     .hover(|segment| segment.bg(rgb(0x252525)))
                                     .cursor_pointer()
@@ -1962,7 +1968,7 @@ impl FileBrowser {
                                         cx.stop_propagation();
                                         this.navigate(path.clone(), window, cx);
                                     }))
-                                    .child(div().min_w(dp(0.)).text_ellipsis().child(label))
+                                    .child(div().min_w(dp(0.)).truncate().child(label))
                                     .into_any_element();
                                 separator.into_iter().chain([segment])
                             },
