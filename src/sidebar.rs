@@ -4,7 +4,10 @@ use std::{
     time::Instant,
 };
 
-use gpui::{App, ExternalPaths, IntoElement, Pixels, Window, div, prelude::*, px, rgb};
+use gpui::{
+    App, ExternalPaths, IntoElement, MouseButton, MouseDownEvent, Pixels, Point, Window, div,
+    prelude::*, px, rgb,
+};
 
 use crate::{
     native_icons::FileIcon,
@@ -36,7 +39,23 @@ pub(super) struct SidebarView<'a> {
     pub go_to: GoTo,
     pub eject: Eject,
     pub trash_files: TrashFiles,
+    pub context_menu: ContextMenuAt,
 }
+
+/// What kind of sidebar item was right-clicked, which decides its menu.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum Place {
+    /// A favorite folder or the Trash.
+    Folder,
+    /// A Recent item, a file or a folder.
+    Recent,
+    Volume {
+        ejectable: bool,
+    },
+}
+
+/// Opens the right-click menu for a sidebar item at a window position.
+pub(super) type ContextMenuAt = Rc<dyn Fn(Point<Pixels>, PathBuf, Place, &mut Window, &mut App)>;
 
 /// Opens a folder in the active tab.
 pub(super) type GoTo = Rc<dyn Fn(PathBuf, &mut Window, &mut App)>;
@@ -111,7 +130,16 @@ impl Sidebar {
             go_to,
             eject,
             trash_files,
+            context_menu,
         } = view;
+        // Right-clicking a row opens its menu, as in Finder's sidebar.
+        let menu_for = |path: PathBuf, place: Place| {
+            let open = context_menu.clone();
+            move |event: &MouseDownEvent, window: &mut Window, cx: &mut App| {
+                cx.stop_propagation();
+                open(event.position, path.clone(), place, window, cx);
+            }
+        };
         div()
             .w(px(width))
             .h_full()
@@ -218,6 +246,10 @@ impl Sidebar {
                                             .when(path != location, |row| {
                                                 row.hover(|row| row.bg(rgb(0x252525)))
                                             })
+                                            .on_mouse_down(
+                                                MouseButton::Right,
+                                                menu_for(path.clone(), Place::Folder),
+                                            )
                                             .on_click(move |_, window, cx| {
                                                 cx.stop_propagation();
                                                 window.dispatch_action(action(), cx);
@@ -254,6 +286,10 @@ impl Sidebar {
                                             .when(path != location, |row| {
                                                 row.hover(|row| row.bg(rgb(0x252525)))
                                             })
+                                            .on_mouse_down(
+                                                MouseButton::Right,
+                                                menu_for(path.clone(), Place::Recent),
+                                            )
                                             .on_click(move |_, window, cx| {
                                                 cx.stop_propagation();
                                                 open(target.clone(), window, cx);
@@ -310,6 +346,15 @@ impl Sidebar {
                                                     cx,
                                                 )
                                             })
+                                            .on_mouse_down(
+                                                MouseButton::Right,
+                                                menu_for(
+                                                    volume.path.clone(),
+                                                    Place::Volume {
+                                                        ejectable: volume.ejectable,
+                                                    },
+                                                ),
+                                            )
                                             .on_click(move |_, window, cx| {
                                                 cx.stop_propagation();
                                                 go(target.clone(), window, cx);
@@ -399,6 +444,10 @@ impl Sidebar {
                                     .on_drop(move |paths: &ExternalPaths, _, cx| {
                                         trash_files(paths.paths().to_vec(), cx)
                                     })
+                                    .on_mouse_down(
+                                        MouseButton::Right,
+                                        menu_for(trash.to_path_buf(), Place::Folder),
+                                    )
                                     .on_click(move |_, window, cx| {
                                         cx.stop_propagation();
                                         go(target.clone(), window, cx);

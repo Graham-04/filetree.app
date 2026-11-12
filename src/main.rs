@@ -43,6 +43,8 @@ static GLOBAL: fsearch::alloc::Alloc = fsearch::alloc::Alloc;
 
 const SEARCH_CLOSED: f32 = 32.;
 const SEARCH_OPEN: f32 = 260.;
+/// The new-tab button, square, beside the tabs.
+const NEW_TAB: f32 = 32.;
 
 actions!(
     filetree,
@@ -63,6 +65,8 @@ actions!(
         CheckForUpdates,
         ArrowKeysHistory,
         ArrowKeysFolderPath,
+        ViewAsList,
+        ViewAsTiles,
         GoLeft,
         GoRight,
         EditPath,
@@ -156,6 +160,8 @@ enum Command {
     CheckForUpdates,
     ArrowsHistory,
     ArrowsFolderPath,
+    ViewList,
+    ViewTiles,
     ResetZoom,
     ClearIndex,
 }
@@ -168,6 +174,8 @@ impl Command {
             Self::CheckForUpdates => "Check for Updates",
             Self::ArrowsHistory => "⌘← ⌘→ Go Back and Forward",
             Self::ArrowsFolderPath => "⌘← ⌘→ Move Along the Folder Path",
+            Self::ViewList => "View as List",
+            Self::ViewTiles => "View as Tiles",
             Self::ResetZoom => "Reset to Default Zoom",
             Self::ClearIndex => "Clear File Index",
         }
@@ -178,6 +186,7 @@ impl Command {
             Self::HiddenFiles => Some("⌘⇧."),
             Self::Sounds | Self::CheckForUpdates => None,
             Self::ArrowsHistory | Self::ArrowsFolderPath => None,
+            Self::ViewList | Self::ViewTiles => None,
             Self::ResetZoom => Some("⌘0"),
             Self::ClearIndex => None,
         }
@@ -190,6 +199,8 @@ impl Command {
             Self::CheckForUpdates => "arrow.down.circle",
             Self::ArrowsHistory => "clock.arrow.circlepath",
             Self::ArrowsFolderPath => "arrow.up.and.down.text.horizontal",
+            Self::ViewList => "list.bullet.rectangle",
+            Self::ViewTiles => "square.grid.3x2",
             Self::ResetZoom => "arrow.counterclockwise",
             Self::ClearIndex => "trash",
         }
@@ -202,6 +213,8 @@ impl Command {
             Self::CheckForUpdates => Box::new(CheckForUpdates),
             Self::ArrowsHistory => Box::new(ArrowKeysHistory),
             Self::ArrowsFolderPath => Box::new(ArrowKeysFolderPath),
+            Self::ViewList => Box::new(ViewAsList),
+            Self::ViewTiles => Box::new(ViewAsTiles),
             Self::ResetZoom => Box::new(ResetZoom),
             Self::ClearIndex => Box::new(ClearFileIndex),
         }
@@ -223,6 +236,8 @@ fn matching_commands(query: &str, updates: bool) -> Vec<Command> {
         Command::CheckForUpdates,
         Command::ArrowsHistory,
         Command::ArrowsFolderPath,
+        Command::ViewList,
+        Command::ViewTiles,
         Command::ResetZoom,
         Command::ClearIndex,
     ]
@@ -238,6 +253,8 @@ fn matching_commands(query: &str, updates: bool) -> Vec<Command> {
             Command::ArrowsFolderPath => {
                 "arrow keys left right folder path parent up down navigation"
             }
+            Command::ViewList => "view as list rows details columns layout",
+            Command::ViewTiles => "view as tiles icons grid thumbnails gallery layout",
             Command::ResetZoom => "reset to default zoom appearance 100%",
             Command::ClearIndex => "clear file index fsearch rebuild cache search",
         };
@@ -367,7 +384,8 @@ impl FileBrowser {
             }
         })
         .detach();
-        let list = file_list_view(Rc::from([]), window, cx);
+        let settings: storage::UserSettings = storage::load(&storage::settings_path(&home));
+        let list = file_list_view(Rc::from([]), settings.view, window, cx);
         let index = search_index::SearchIndex::new(home.clone());
         // Subscribe before starting, so no early progress change is missed.
         let mut changes = index.changes();
@@ -417,7 +435,7 @@ impl FileBrowser {
             search_trim: None,
             next_tab_id: 1,
             selected_command: 0,
-            settings: storage::load(&storage::settings_path(&home)),
+            settings,
             settings_path: storage::settings_path(&home),
             session_path: storage::session_path(&home),
             recent: classify_recent(session.recent),
@@ -465,7 +483,7 @@ impl FileBrowser {
         browser.sync_watched();
         browser.watch_for_updates(cx);
         for location in saved_tabs {
-            let list = file_list_view(Rc::from([]), window, cx);
+            let list = file_list_view(Rc::from([]), browser.settings.view, window, cx);
             browser.tabs.push(BrowserTab {
                 id: browser.next_tab_id,
                 location,
@@ -1061,7 +1079,7 @@ impl FileBrowser {
                         if !(quiet && is_search) {
                             list.set_entries(Rc::from([]), cx);
                         }
-                        list.set_message(Some(format!("{error:#}")), cx);
+                        list.set_error(&error, cx);
                     }
                 });
                 if stale {
@@ -1158,6 +1176,7 @@ impl FileBrowser {
                     selected: None,
                     can_paste: !system::pasted_files().is_empty(),
                     open_with: None,
+                    sidebar: None,
                 });
                 // The menu takes the keyboard until it closes.
                 self.focus.focus(window);
@@ -1179,8 +1198,28 @@ impl FileBrowser {
             menu.paths.clone()
         };
         match action {
+            // A Recent item opens as a click on it does.
+            FileAction::Open if menu.sidebar.is_some() => {
+                if let Some(path) = menu.paths.first() {
+                    self.open_recent(path.clone(), window, cx);
+                }
+            }
             // Enter on Open With opens with the default app.
             FileAction::Open | FileAction::OpenWith => self.open_paths(&menu.paths, window, cx),
+            FileAction::OpenInNewTab => {
+                if let Some(path) = menu.paths.first() {
+                    self.open_tab(path.clone(), window, cx);
+                }
+            }
+            FileAction::Eject => {
+                if let Some(path) = menu.paths.first() {
+                    self.eject(path.clone(), cx);
+                }
+            }
+            FileAction::RemoveFromRecent => {
+                self.recent.retain(|(path, _)| !menu.paths.contains(path));
+                self.save_session();
+            }
             FileAction::QuickLook => {
                 quick_look::toggle(menu.paths.into_iter().take(quick_look::LIMIT).collect())
             }
@@ -1202,9 +1241,10 @@ impl FileBrowser {
 
     /// Runs `action` from its shortcut if the open menu offers it.
     fn run_shortcut(&mut self, action: FileAction, window: &mut Window, cx: &mut Context<Self>) {
-        let offered = self.context_menu.as_ref().is_some_and(|menu| {
-            FileAction::menu(&menu.paths, menu.can_paste).contains(&Some(action))
-        });
+        let offered = self
+            .context_menu
+            .as_ref()
+            .is_some_and(|menu| menu.items().contains(&Some(action)));
         if offered {
             self.run_file_action(action, window, cx);
         }
@@ -1215,6 +1255,28 @@ impl FileBrowser {
             self.focus_list(window, cx);
             cx.notify();
         }
+    }
+
+    /// The right-click menu for a sidebar item at `position`.
+    fn open_sidebar_menu(
+        &mut self,
+        position: gpui::Point<gpui::Pixels>,
+        path: PathBuf,
+        place: sidebar::Place,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.context_menu = Some(ContextMenu {
+            position,
+            sidebar: Some((place, path.is_dir())),
+            paths: vec![path],
+            selected: None,
+            can_paste: false,
+            open_with: None,
+        });
+        // The menu takes the keyboard until it closes.
+        self.focus.focus(window);
+        cx.notify();
     }
 
     /// Shows the Open With submenu, finding the apps once per menu.
@@ -1642,6 +1704,20 @@ impl FileBrowser {
         cx.notify();
     }
 
+    /// Shows every tab's folder as rows or tiles, and remembers the choice.
+    fn set_view(&mut self, view: storage::View, window: &mut Window, cx: &mut Context<Self>) {
+        self.command_menu_open = false;
+        self.settings.view = view;
+        if let Err(error) = storage::save(&self.settings_path, &self.settings) {
+            eprintln!("Could not save settings: {error:#}");
+        }
+        for tab in &self.tabs {
+            tab.list.update(cx, |list, cx| list.set_view(view, cx));
+        }
+        self.focus_list(window, cx);
+        cx.notify();
+    }
+
     fn go_up(&mut self, _: &GoUp, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(parent) = self.tabs[self.active_tab].location.parent() {
             self.navigate(parent.to_path_buf(), window, cx);
@@ -1975,6 +2051,44 @@ impl FileBrowser {
                         )),
                 )
             })
+            .child(self.view_toggle(cx))
+    }
+
+    /// Rows or tiles, at the path bar's right end.
+    fn view_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let option = |view: storage::View, symbol: &'static str, tip: &'static str| {
+            let chosen = self.settings.view == view;
+            div()
+                .id(tip)
+                .size(dp(24.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(dp(radius::SM))
+                .when(chosen, |button| button.bg(rgb(0x303030)))
+                .when(!chosen, |button| {
+                    button
+                        .cursor_pointer()
+                        .hover(|button| button.bg(rgb(0x252525)))
+                })
+                .tooltip(ui::tooltip(tip))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.set_view(view, window, cx);
+                }))
+                .child(native_icons::symbol(symbol, 14.))
+        };
+        div()
+            .flex()
+            .flex_shrink_0()
+            .gap(dp(2.))
+            .ml(dp(8.))
+            .child(option(storage::View::List, "list.bullet", "View as List"))
+            .child(option(
+                storage::View::Tiles,
+                "rectangle.grid.2x2",
+                "View as Tiles",
+            ))
     }
 
     fn open_search(&mut self, _: &OpenSearch, window: &mut Window, cx: &mut Context<Self>) {
@@ -2086,12 +2200,17 @@ impl FileBrowser {
     }
 
     fn new_tab(&mut self, _: &NewTab, window: &mut Window, cx: &mut Context<Self>) {
+        let location = self.tabs[self.active_tab].location.clone();
+        self.open_tab(location, window, cx);
+    }
+
+    /// Opens `location` in a new tab after the others and switches to it.
+    fn open_tab(&mut self, location: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         self.tabs[self.active_tab]
             .list
             .update(cx, |list, cx| list.end_drag(cx));
-        let location = self.tabs[self.active_tab].location.clone();
         let entries = self.folders.get(&location).unwrap_or_else(|| Rc::from([]));
-        let list = file_list_view(entries, window, cx);
+        let list = file_list_view(entries, self.settings.view, window, cx);
         self.tabs.push(BrowserTab {
             id: self.next_tab_id,
             location,
@@ -2151,7 +2270,8 @@ impl FileBrowser {
         let search_width = SEARCH_CLOSED + (SEARCH_OPEN - SEARCH_CLOSED) * search_amount;
         let available = f32::from(window.viewport_size().width)
             - sidebar_width.max(controls_width)
-            - (search_width + 10.) * scale;
+            // The new-tab and search buttons, their gaps, and the right padding.
+            - (NEW_TAB + search_width + 14.) * scale;
         let width = ((available / scale - 4. * (self.tabs.len() - 1) as f32)
             / self.tabs.len() as f32)
             .max(36.);
@@ -2241,6 +2361,23 @@ impl FileBrowser {
             .gap(dp(4.))
             .pr(dp(6.))
             .child(tabs)
+            .child(
+                div()
+                    .id("new-tab")
+                    .flex_shrink_0()
+                    .size(dp(NEW_TAB))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(dp(radius::MD))
+                    .cursor_pointer()
+                    .hover(|button| button.bg(rgb(0x353535)))
+                    .on_click(|_, window, cx| {
+                        cx.stop_propagation();
+                        window.dispatch_action(Box::new(NewTab), cx);
+                    })
+                    .child(native_icons::symbol("plus", row::ICON)),
+            )
             .child(self.search_field(search_amount, cx))
     }
 
@@ -2332,10 +2469,7 @@ impl FileBrowser {
         let Some(menu) = &mut self.context_menu else {
             return;
         };
-        let count = FileAction::menu(&menu.paths, menu.can_paste)
-            .into_iter()
-            .flatten()
-            .count();
+        let count = menu.items().into_iter().flatten().count();
         menu.selected = Some(match menu.selected {
             None if step > 0 => 0,
             None => count - 1,
@@ -2356,7 +2490,7 @@ impl FileBrowser {
         const PADDING: f32 = 4.;
         const SEPARATOR: f32 = 9.;
         const SUBMENU_WIDTH: f32 = 240.;
-        let items = FileAction::menu(&menu.paths, menu.can_paste);
+        let items = menu.items();
         let scale = f32::from(dp(1.).to_pixels(window.rem_size()));
         // Where the Open With row sits, for its submenu.
         let open_with_top = PADDING
@@ -2693,6 +2827,14 @@ impl FileBrowser {
                                                     == storage::ArrowKeys::FolderPath,
                                             ))
                                         }
+                                        MenuItem::Command(Command::ViewList) => Some(ui::checkbox(
+                                            self.settings.view == storage::View::List,
+                                        )),
+                                        MenuItem::Command(Command::ViewTiles) => {
+                                            Some(ui::checkbox(
+                                                self.settings.view == storage::View::Tiles,
+                                            ))
+                                        }
                                         _ => None,
                                     })
                             }),
@@ -2780,10 +2922,7 @@ impl Render for FileBrowser {
             )
             .on_action(cx.listener(|this, _: &ContextMenuRun, window, cx| {
                 let action = this.context_menu.as_ref().and_then(|menu| {
-                    let actions: Vec<FileAction> = FileAction::menu(&menu.paths, menu.can_paste)
-                        .into_iter()
-                        .flatten()
-                        .collect();
+                    let actions: Vec<FileAction> = menu.items().into_iter().flatten().collect();
                     menu.selected.and_then(|index| actions.get(index).copied())
                 });
                 match action {
@@ -2939,6 +3078,12 @@ impl Render for FileBrowser {
             .on_action(cx.listener(|this, _: &ArrowKeysFolderPath, _, cx| {
                 this.set_arrow_keys(storage::ArrowKeys::FolderPath, cx)
             }))
+            .on_action(cx.listener(|this, _: &ViewAsList, window, cx| {
+                this.set_view(storage::View::List, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ViewAsTiles, window, cx| {
+                this.set_view(storage::View::Tiles, window, cx)
+            }))
             .on_action(cx.listener(Self::toggle_search_scope))
             .on_action(cx.listener(Self::go_back))
             .on_action(cx.listener(Self::go_forward))
@@ -3026,6 +3171,16 @@ impl Render for FileBrowser {
                 sounds_muted: self.settings.mute_sounds,
                 volumes: &self.volumes,
                 trash: &self.home.join(".Trash"),
+                context_menu: {
+                    let browser = cx.entity().downgrade();
+                    Rc::new(
+                        move |position, path, place, window: &mut Window, cx: &mut App| {
+                            let _ = browser.update(cx, |this, cx| {
+                                this.open_sidebar_menu(position, path, place, window, cx)
+                            });
+                        },
+                    )
+                },
                 go_to: {
                     let browser = cx.entity().downgrade();
                     Rc::new(move |path, window: &mut Window, cx: &mut App| {
@@ -3182,10 +3337,11 @@ impl Render for FileBrowser {
 
 fn file_list_view(
     entries: Rc<[FileEntry]>,
+    view: storage::View,
     window: &mut Window,
     cx: &mut Context<FileBrowser>,
 ) -> Entity<FileList> {
-    let list = cx.new(|cx| FileList::new(entries, cx));
+    let list = cx.new(|cx| FileList::new(entries, view, cx));
     cx.subscribe_in(&list, window, |this, list, request, window, cx| {
         this.handle_list_request(list, request, window, cx)
     })
@@ -3197,6 +3353,7 @@ fn file_list_view(
 #[derive(Clone, Copy, PartialEq)]
 enum FileAction {
     Open,
+    OpenInNewTab,
     OpenWith,
     QuickLook,
     Rename,
@@ -3207,12 +3364,15 @@ enum FileAction {
     ShowInFinder,
     Trash,
     NewFolder,
+    Eject,
+    RemoveFromRecent,
 }
 
 impl FileAction {
     fn label(self) -> &'static str {
         match self {
             Self::Open => "Open",
+            Self::OpenInNewTab => "Open in New Tab",
             Self::OpenWith => "Open With",
             Self::QuickLook => "Quick Look",
             Self::Rename => "Rename",
@@ -3223,13 +3383,19 @@ impl FileAction {
             Self::ShowInFinder => "Show in Finder",
             Self::Trash => "Move to Trash",
             Self::NewFolder => "New Folder",
+            Self::Eject => "Eject",
+            Self::RemoveFromRecent => "Remove from Recent",
         }
     }
 
     fn shortcut(self) -> Option<&'static str> {
         match self {
             Self::Open => Some("⌘↓"),
-            Self::OpenWith | Self::ShowInFinder => None,
+            Self::OpenWith
+            | Self::ShowInFinder
+            | Self::OpenInNewTab
+            | Self::Eject
+            | Self::RemoveFromRecent => None,
             Self::QuickLook => Some("Space"),
             Self::Rename => Some("R"),
             Self::Duplicate => Some("⌘D"),
@@ -3239,6 +3405,28 @@ impl FileAction {
             Self::Trash => Some("⌘⌫"),
             Self::NewFolder => Some("⇧⌘N"),
         }
+    }
+
+    /// The menu for a sidebar item, `None` marking separators. `folder` is
+    /// whether a Recent item is a folder, which opens in a new tab rather
+    /// than with its app.
+    fn sidebar_menu(place: sidebar::Place, folder: bool) -> Vec<Option<Self>> {
+        let open = match place {
+            sidebar::Place::Recent if !folder => Self::Open,
+            _ => Self::OpenInNewTab,
+        };
+        let mut items = vec![
+            Some(open),
+            None,
+            Some(Self::ShowInFinder),
+            Some(Self::CopyPath),
+        ];
+        match place {
+            sidebar::Place::Recent => items.extend([None, Some(Self::RemoveFromRecent)]),
+            sidebar::Place::Volume { ejectable: true } => items.extend([None, Some(Self::Eject)]),
+            sidebar::Place::Folder | sidebar::Place::Volume { ejectable: false } => {}
+        }
+        items
     }
 
     /// The menu for `paths`, `None` marking separators. Blank space (no
@@ -3312,6 +3500,19 @@ struct ContextMenu {
     can_paste: bool,
     /// The Open With submenu's apps, with icons, while it is showing.
     open_with: Option<Vec<(system::App, native_icons::FileIcon)>>,
+    /// For a sidebar item: what kind, and whether it is a folder. `None`
+    /// for files in the list.
+    sidebar: Option<(sidebar::Place, bool)>,
+}
+
+impl ContextMenu {
+    /// The actions offered, `None` marking separators.
+    fn items(&self) -> Vec<Option<FileAction>> {
+        match self.sidebar {
+            Some((place, folder)) => FileAction::sidebar_menu(place, folder),
+            None => FileAction::menu(&self.paths, self.can_paste),
+        }
+    }
 }
 
 /// Clickable path components: from the home folder when inside it,

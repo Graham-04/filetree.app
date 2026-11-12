@@ -27,6 +27,18 @@ pub(super) struct UserSettings {
     /// default, sounds on, needs no special case.
     pub mute_sounds: bool,
     pub arrow_keys: ArrowKeys,
+    pub view: View,
+}
+
+/// How the file list shows a folder, in every tab.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum View {
+    /// Rows with name, date modified, and size.
+    #[default]
+    List,
+    /// Large icons or thumbnails in a grid, named beneath.
+    Tiles,
 }
 
 /// What ⌘← and ⌘→ do in the file list. ⌘[ ⌘] always go back and forward and

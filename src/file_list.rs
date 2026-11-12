@@ -1,6 +1,7 @@
 use crate::{
     native_icons,
     search_input::SearchInput,
+    storage::View,
     ui::{self, dp, radius, row, text_size},
 };
 use anyhow::Context as _;
@@ -34,6 +35,10 @@ actions!(
         ExtendNext,
         SelectFirst,
         SelectLast,
+        SelectLeft,
+        SelectRight,
+        ExtendLeft,
+        ExtendRight,
         QuickLookSelected,
         TrashSelected,
         CopySelectedPaths,
@@ -56,6 +61,11 @@ pub(super) fn init(cx: &mut App) {
         KeyBinding::new("shift-down", ExtendNext, Some("FileList")),
         KeyBinding::new("alt-up", SelectFirst, Some("FileList")),
         KeyBinding::new("alt-down", SelectLast, Some("FileList")),
+        // Across tiles; rows ignore them.
+        KeyBinding::new("left", SelectLeft, Some("FileList")),
+        KeyBinding::new("right", SelectRight, Some("FileList")),
+        KeyBinding::new("shift-left", ExtendLeft, Some("FileList")),
+        KeyBinding::new("shift-right", ExtendRight, Some("FileList")),
         KeyBinding::new("space", QuickLookSelected, Some("FileList")),
         KeyBinding::new("cmd-backspace", TrashSelected, Some("FileList")),
         KeyBinding::new("alt-cmd-c", CopySelectedPaths, Some("FileList")),
@@ -65,6 +75,21 @@ pub(super) fn init(cx: &mut App) {
         KeyBinding::new("escape", CancelRename, Some("Rename")),
     ]);
 }
+
+/// How a folder sorts until a column heading is clicked: most recently
+/// modified first, so what was just worked on is at the top.
+const DEFAULT_SORT: Column = Column::Modified;
+const DEFAULT_ASCENDING: bool = false;
+
+/// The list's padding left and right of the rows or tiles.
+const INSET: f32 = 14.;
+/// Each tile's cell, including the space around it, and its icon.
+const TILE_WIDTH: f32 = 104.;
+const TILE_HEIGHT: f32 = 112.;
+const TILE_ICON: f32 = 64.;
+/// How much narrower than its tile a name's text is: the gap between
+/// neighbors and the padding inside the name's highlight.
+const TILE_NAME_MARGIN: f32 = 18.;
 
 /// What the list asks the browser to do. The list owns selection and inline
 /// editing; the browser performs file operations and shows menus.
@@ -145,6 +170,64 @@ pub(super) struct FileEntry {
     drop_target: bool,
 }
 
+/// A folder macOS privacy settings keep the app out of, and the setting that
+/// lets it in.
+#[derive(Clone, Debug)]
+pub(super) struct NoAccess {
+    name: String,
+    setting: PrivacySetting,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) enum PrivacySetting {
+    /// Desktop, Documents, Downloads, and volumes each have their own switch.
+    FilesAndFolders,
+    /// Everything else protected, such as the Trash.
+    FullDiskAccess,
+}
+
+impl PrivacySetting {
+    fn label(self) -> &'static str {
+        match self {
+            Self::FilesAndFolders => "Files and Folders",
+            Self::FullDiskAccess => "Full Disk Access",
+        }
+    }
+
+    /// Opens System Settings at this pane of Privacy & Security.
+    fn open(self) {
+        let pane = match self {
+            Self::FilesAndFolders => "Privacy_FilesAndFolders",
+            Self::FullDiskAccess => "Privacy_AllFiles",
+        };
+        let url = format!("x-apple.systempreferences:com.apple.preference.security?{pane}");
+        if let Err(error) = std::process::Command::new("/usr/bin/open").arg(url).spawn() {
+            eprintln!("Could not open System Settings: {error}");
+        }
+    }
+}
+
+impl std::fmt::Display for NoAccess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Filetree doesn’t have access to “{}”. Allow it in System Settings › Privacy & \
+             Security › {}.",
+            self.name,
+            self.setting.label()
+        )
+    }
+}
+
+impl std::error::Error for NoAccess {}
+
+/// What the list shows in place of rows when it has none.
+#[derive(Clone)]
+enum Message {
+    Text(SharedString),
+    NoAccess(NoAccess),
+}
+
 pub(super) fn read_directory(directory: &std::path::Path) -> anyhow::Result<Vec<FileEntry>> {
     fsearch::no_materialize();
     let listing = match fs::read_dir(directory) {
@@ -162,19 +245,16 @@ pub(super) fn read_directory(directory: &std::path::Path) -> anyhow::Result<Vec<
             let own_switch = ["Desktop", "Documents", "Downloads"].contains(&name.as_ref())
                 || directory.starts_with("/Volumes");
             let setting = if own_switch {
-                "Files and Folders"
+                PrivacySetting::FilesAndFolders
             } else {
-                "Full Disk Access"
+                PrivacySetting::FullDiskAccess
             };
             let name = if name == ".Trash" {
                 "Trash".into()
             } else {
-                name
+                name.into_owned()
             };
-            anyhow::bail!(
-                "Filetree doesn’t have access to “{name}”. Allow it in System Settings › \
-                 Privacy & Security › {setting}."
-            );
+            return Err(NoAccess { name, setting }.into());
         }
         Err(error) => {
             return Err(error).with_context(|| format!("Could not read {}", directory.display()));
@@ -183,10 +263,10 @@ pub(super) fn read_directory(directory: &std::path::Path) -> anyhow::Result<Vec<
     let paths = listing
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
         .collect();
-    // Name order matches the default view, so refreshed listings that keep
-    // the current order can be applied without re-sorting.
+    // Sorted in the default order here, off the UI thread, so the list's own
+    // sort finds it already in order.
     let mut entries = entries_for_paths(paths);
-    entries.sort_unstable_by(|a, b| compare_entries(a, b, Column::Name, true));
+    entries.sort_unstable_by(|a, b| compare_entries(a, b, DEFAULT_SORT, DEFAULT_ASCENDING));
     Ok(entries)
 }
 
@@ -417,21 +497,26 @@ struct Drag {
     extend: bool,
     toggle: bool,
     active: bool,
-    hits: Range<usize>,
+    /// Under the marquee: one range of rows, or a block of tiles.
+    hits: Selection,
     last_frame: Instant,
+    /// The row or tile height it started with; a zoom ends it.
     row_height: Pixels,
 }
 
 pub(super) struct FileList {
+    view: View,
     entries: Rc<[FileEntry]>,
     order: Vec<usize>,
     sort_column: Column,
     ascending: bool,
     explicit_sort: bool,
+    /// Search results, kept in relevance order until a heading is clicked.
+    ranked: bool,
     modified_width: f32,
     size_width: f32,
     resizing: Option<ColumnResize>,
-    message: Option<String>,
+    message: Option<Message>,
     /// Pending until a load runs long enough to deserve the bar, so quick
     /// results never flash it.
     loading: Option<Task<()>>,
@@ -460,19 +545,21 @@ struct Press {
 }
 
 impl FileList {
-    pub(super) fn new(entries: Rc<[FileEntry]>, cx: &mut Context<Self>) -> Self {
+    pub(super) fn new(entries: Rc<[FileEntry]>, view: View, cx: &mut Context<Self>) -> Self {
         let virtual_scroll = UniformListScrollHandle::new();
         let scroll = virtual_scroll.0.borrow().base_handle.clone();
         let mut order: Vec<usize> = (0..entries.len()).collect();
         order.sort_unstable_by(|a, b| {
-            compare_entries(&entries[*a], &entries[*b], Column::Name, true)
+            compare_entries(&entries[*a], &entries[*b], DEFAULT_SORT, DEFAULT_ASCENDING)
         });
         Self {
+            view,
             entries,
             order,
-            sort_column: Column::Name,
-            ascending: true,
+            sort_column: DEFAULT_SORT,
+            ascending: DEFAULT_ASCENDING,
             explicit_sort: false,
+            ranked: false,
             modified_width: 188.,
             size_width: 92.,
             resizing: None,
@@ -492,9 +579,61 @@ impl FileList {
         }
     }
 
+    /// Shows the folder as rows or tiles, from the top.
+    pub(super) fn set_view(&mut self, view: View, cx: &mut Context<Self>) {
+        if self.view == view {
+            return;
+        }
+        self.view = view;
+        self.drag = None;
+        self.scroll.set_offset(point(px(0.), px(0.)));
+        cx.notify();
+    }
+
+    /// Items per line: tiles that fit the list's width, or one row.
+    fn columns(&self, window: &Window) -> usize {
+        match self.view {
+            View::List => 1,
+            View::Tiles => {
+                let inset = dp(INSET).to_pixels(window.rem_size());
+                let tile = dp(TILE_WIDTH).to_pixels(window.rem_size());
+                let width = self.scroll.bounds().size.width - inset * 2.;
+                ((f32::from(width) / f32::from(tile)).floor() as usize).max(1)
+            }
+        }
+    }
+
+    /// A tile's width: the list's width shared evenly among `columns`, so
+    /// the grid fills it with no gap left at the right.
+    fn tile_width(&self, columns: usize, window: &Window) -> Pixels {
+        let inset = dp(INSET).to_pixels(window.rem_size());
+        let width = self.scroll.bounds().size.width - inset * 2.;
+        (width / columns as f32).max(dp(TILE_WIDTH).to_pixels(window.rem_size()))
+    }
+
+    /// The height of one line of rows or tiles.
+    fn line_height(&self, window: &Window) -> Pixels {
+        dp(match self.view {
+            View::List => row::HEIGHT,
+            View::Tiles => TILE_HEIGHT,
+        })
+        .to_pixels(window.rem_size())
+    }
+
     /// Shown centered in place of rows when the list is empty.
     pub(super) fn set_message(&mut self, message: Option<String>, cx: &mut Context<Self>) {
-        self.message = message;
+        self.message = message.map(|message| Message::Text(message.into()));
+        self.stop_loading();
+        cx.notify();
+    }
+
+    /// Shows why the folder could not be listed: a way into System Settings
+    /// when macOS privacy settings are the reason, otherwise the error.
+    pub(super) fn set_error(&mut self, error: &anyhow::Error, cx: &mut Context<Self>) {
+        self.message = Some(match error.downcast_ref::<NoAccess>() {
+            Some(no_access) => Message::NoAccess(no_access.clone()),
+            None => Message::Text(format!("{error:#}").into()),
+        });
         self.stop_loading();
         cx.notify();
     }
@@ -518,10 +657,12 @@ impl FileList {
     }
 
     pub(super) fn set_search_entries(&mut self, entries: Rc<[FileEntry]>, cx: &mut Context<Self>) {
+        self.ranked = true;
         self.replace_entries(entries, self.explicit_sort, cx);
     }
 
     pub(super) fn set_entries(&mut self, entries: Rc<[FileEntry]>, cx: &mut Context<Self>) {
+        self.ranked = false;
         self.replace_entries(entries, true, cx);
     }
 
@@ -546,7 +687,9 @@ impl FileList {
         let Some((entries, empty_message)) = self.pending_entries.take() else {
             return false;
         };
-        self.message = entries.is_empty().then(|| empty_message.into());
+        self.message = entries
+            .is_empty()
+            .then(|| Message::Text(empty_message.into()));
         if self.entries == entries {
             return false;
         }
@@ -563,7 +706,7 @@ impl FileList {
             .map(|entry| self.entries[*entry].path.clone());
         self.entries = entries;
         self.order = (0..self.entries.len()).collect();
-        if self.explicit_sort {
+        if self.explicit_sort || !self.ranked {
             self.reorder();
         }
         let selected_entries: Vec<_> = self
@@ -771,12 +914,16 @@ impl FileList {
         if let Some(drag) = drag.filter(|drag| drag.active) {
             if drag.toggle {
                 self.selected = drag.baseline;
-                self.selected.toggle(drag.hits);
+                for range in drag.hits.0 {
+                    self.selected.toggle(range);
+                }
             } else if drag.extend {
                 self.selected = drag.baseline;
-                self.selected.add(drag.hits);
+                for range in drag.hits.0 {
+                    self.selected.add(range);
+                }
             } else {
-                self.selected.replace(drag.hits);
+                self.selected = drag.hits;
             }
         }
         let updated = self.resizing.is_none() && self.apply_pending_entries();
@@ -785,11 +932,9 @@ impl FileList {
 
     fn is_selected(&self, index: usize) -> bool {
         match self.drag.as_ref().filter(|drag| drag.active) {
-            Some(drag) if drag.toggle => drag.baseline.contains(index) ^ drag.hits.contains(&index),
-            Some(drag) if drag.extend => {
-                drag.baseline.contains(index) || drag.hits.contains(&index)
-            }
-            Some(drag) => drag.hits.contains(&index),
+            Some(drag) if drag.toggle => drag.baseline.contains(index) ^ drag.hits.contains(index),
+            Some(drag) if drag.extend => drag.baseline.contains(index) || drag.hits.contains(index),
+            Some(drag) => drag.hits.contains(index),
             None => self.selected.contains(index),
         }
     }
@@ -804,7 +949,13 @@ impl FileList {
 
     /// Moves the selection by `step` rows (clamped to the list), or extends it
     /// from the anchor when `extend` is set, and scrolls the moved row into view.
-    fn step_selection(&mut self, step: isize, extend: bool, cx: &mut Context<Self>) {
+    fn step_selection(
+        &mut self,
+        step: isize,
+        extend: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
         let head = self.anchor.map(|anchor| {
             match self.selected.0.iter().find(|range| range.contains(&anchor)) {
                 Some(range) if range.start < anchor => range.start,
@@ -821,7 +972,7 @@ impl FileList {
         self.selected.replace(range);
         self.anchor = Some(anchor);
         self.virtual_scroll
-            .scroll_to_item(target, gpui::ScrollStrategy::Top);
+            .scroll_to_item(target / self.columns(window), gpui::ScrollStrategy::Top);
         cx.notify();
     }
 
@@ -848,17 +999,27 @@ impl FileList {
         self.request_selected(Request::Open, cx);
     }
 
-    /// The row under `position` (window coordinates), if any.
-    fn row_at(&self, position: Point<Pixels>, window: &Window) -> Option<usize> {
+    /// The row or tile under `position` (window coordinates), if any.
+    fn item_at(&self, position: Point<Pixels>, window: &Window) -> Option<usize> {
         let position = self.content_point(position);
-        let height = dp(row::HEIGHT).to_pixels(window.rem_size());
-        let index = (f32::from(position.y) / f32::from(height)).floor();
-        let inset = dp(14.).to_pixels(window.rem_size());
-        (index >= 0.
-            && index < self.entries.len() as f32
-            && position.x >= inset
-            && position.x <= self.scroll.bounds().size.width - inset)
-            .then_some(index as usize)
+        let line = (f32::from(position.y) / f32::from(self.line_height(window))).floor();
+        let inset = dp(INSET).to_pixels(window.rem_size());
+        if line < 0. || position.x < inset || position.x > self.scroll.bounds().size.width - inset {
+            return None;
+        }
+        let column = match self.view {
+            View::List => 0,
+            View::Tiles => {
+                let tile = self.tile_width(self.columns(window), window);
+                let column = (f32::from(position.x - inset) / f32::from(tile)).floor() as usize;
+                if column >= self.columns(window) {
+                    return None;
+                }
+                column
+            }
+        };
+        let index = line as usize * self.columns(window) + column;
+        (index < self.entries.len()).then_some(index)
     }
 
     /// Right-click selects the row under the pointer unless it is already
@@ -871,7 +1032,7 @@ impl FileList {
     ) {
         self.focus.focus(window);
         self.drag = None;
-        match self.row_at(event.position, window) {
+        match self.item_at(event.position, window) {
             Some(row) if !self.selected.contains(row) => {
                 self.selected.replace(row..row + 1);
                 self.anchor = Some(row);
@@ -908,7 +1069,7 @@ impl FileList {
         self.anchor = Some(row);
         self.drag = None;
         self.virtual_scroll
-            .scroll_to_item(row, gpui::ScrollStrategy::Top);
+            .scroll_to_item(row / self.columns(window), gpui::ScrollStrategy::Top);
         let name = self.entries[self.order[row]].name.to_string();
         let stem = match name.rfind('.') {
             Some(dot) if dot > 0 && !path.is_dir() => dot,
@@ -1025,8 +1186,8 @@ impl FileList {
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.focus.focus(window);
         let position = self.content_point(event.position);
-        let height = dp(row::HEIGHT).to_pixels(window.rem_size());
-        let hit = self.row_at(event.position, window);
+        let height = self.line_height(window);
+        let hit = self.item_at(event.position, window);
         if let Some(index) = hit
             && event.click_count == 2
             && !event.modifiers.shift
@@ -1094,7 +1255,7 @@ impl FileList {
             extend: event.modifiers.shift,
             toggle: event.modifiers.platform,
             active: false,
-            hits: 0..0,
+            hits: Selection::default(),
             last_frame: Instant::now(),
             row_height: height,
         });
@@ -1133,6 +1294,9 @@ impl FileList {
 
     fn update_drag(&mut self, mouse: Point<Pixels>, window: &Window) {
         let position = self.content_point(mouse);
+        let columns = self.columns(window);
+        let tile_width = self.tile_width(columns, window);
+        let width = self.scroll.bounds().size.width;
         let Some(drag) = &mut self.drag else {
             return;
         };
@@ -1143,14 +1307,32 @@ impl FileList {
         }
         drag.active = true;
         drag.current = position;
-        drag.hits = intersecting_rows(
-            drag.origin,
-            position,
-            dp(row::HEIGHT).to_pixels(window.rem_size()),
-            self.entries.len(),
-            dp(14.).to_pixels(window.rem_size()),
-            self.scroll.bounds().size.width - dp(14.).to_pixels(window.rem_size()),
-        );
+        let inset = dp(INSET).to_pixels(window.rem_size());
+        let count = self.entries.len();
+        drag.hits = match self.view {
+            View::List => {
+                let rows = intersecting_rows(
+                    drag.origin,
+                    position,
+                    dp(row::HEIGHT).to_pixels(window.rem_size()),
+                    count,
+                    inset,
+                    width - inset,
+                );
+                let mut hits = Selection::default();
+                if !rows.is_empty() {
+                    hits.add(rows);
+                }
+                hits
+            }
+            View::Tiles => intersecting_tiles(
+                drag.origin - point(inset, px(0.)),
+                position - point(inset, px(0.)),
+                size(tile_width, dp(TILE_HEIGHT).to_pixels(window.rem_size())),
+                columns,
+                count,
+            ),
+        };
     }
 
     fn auto_scroll(&mut self, window: &Window) {
@@ -1158,10 +1340,11 @@ impl FileList {
             self.finish_drag();
             return;
         }
+        let line_height = self.line_height(window);
         let Some(drag) = &mut self.drag else {
             return;
         };
-        if drag.row_height != dp(row::HEIGHT).to_pixels(window.rem_size()) {
+        if drag.row_height != line_height {
             self.finish_drag();
             return;
         }
@@ -1221,6 +1404,39 @@ fn intersecting_rows(
     first..last
 }
 
+/// The tiles a marquee from `origin` to `end` touches, with the grid's left
+/// edge at x = 0: a block of columns on each line it spans.
+fn intersecting_tiles(
+    origin: Point<Pixels>,
+    end: Point<Pixels>,
+    tile: gpui::Size<Pixels>,
+    columns: usize,
+    count: usize,
+) -> Selection {
+    let mut hits = Selection::default();
+    let (width, height) = (f32::from(tile.width), f32::from(tile.height));
+    let left = f32::from(origin.x.min(end.x)).max(0.);
+    let right = f32::from(origin.x.max(end.x));
+    let top = f32::from(origin.y.min(end.y)).max(0.);
+    let bottom = f32::from(origin.y.max(end.y));
+    if count == 0 || right < 0. || bottom < 0. {
+        return hits;
+    }
+    let first_column = (left / width).floor() as usize;
+    let end_column = ((right / width).floor() as usize + 1).min(columns);
+    let lines = count.div_ceil(columns);
+    let first_line = (top / height).floor() as usize;
+    let end_line = ((bottom / height).floor() as usize + 1).min(lines);
+    for line in first_line..end_line {
+        let start = line * columns + first_column;
+        let stop = (line * columns + end_column).min(count);
+        if start < stop {
+            hits.add(start..stop);
+        }
+    }
+    hits
+}
+
 // Logical points per second. Within the viewport, ease into edge scrolling;
 // outside, rise gently from 500 to 800 over 160pt and stop accelerating there.
 fn edge_scroll_speed(y: f32, height: f32) -> f32 {
@@ -1274,6 +1490,18 @@ impl Render for FileList {
             .filter(|drag| drag.active)
             .map(|drag| (drag.origin, drag.current));
         let scroll = self.scroll.clone();
+        let columns = self.columns(window);
+        let lines = self.entries.len().div_ceil(columns);
+        if self.view == View::Tiles {
+            // The grid is laid out from the width the last frame measured;
+            // if this frame measures another, lay it out again.
+            let width = self.scroll.bounds().size.width;
+            cx.on_next_frame(window, move |this, _, cx| {
+                if this.scroll.bounds().size.width != width {
+                    cx.notify();
+                }
+            });
+        }
         div()
             .id("file-list")
             .relative()
@@ -1321,22 +1549,43 @@ impl Render for FileList {
                     into: None,
                 });
             }))
-            .on_action(
-                cx.listener(|this, _: &SelectPrevious, _, cx| this.step_selection(-1, false, cx)),
-            )
-            .on_action(cx.listener(|this, _: &SelectNext, _, cx| this.step_selection(1, false, cx)))
-            .on_action(
-                cx.listener(|this, _: &ExtendPrevious, _, cx| this.step_selection(-1, true, cx)),
-            )
-            .on_action(cx.listener(|this, _: &ExtendNext, _, cx| this.step_selection(1, true, cx)))
-            .on_action(cx.listener(|this, _: &SelectFirst, _, cx| {
-                this.step_selection(isize::MIN, false, cx)
+            // Up and down move a line: one row, or a row of tiles.
+            .on_action(cx.listener(|this, _: &SelectPrevious, window, cx| {
+                let line = this.columns(window) as isize;
+                this.step_selection(-line, false, window, cx)
             }))
-            .on_action(
-                cx.listener(|this, _: &SelectLast, _, cx| {
-                    this.step_selection(isize::MAX, false, cx)
-                }),
-            )
+            .on_action(cx.listener(|this, _: &SelectNext, window, cx| {
+                let line = this.columns(window) as isize;
+                this.step_selection(line, false, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ExtendPrevious, window, cx| {
+                let line = this.columns(window) as isize;
+                this.step_selection(-line, true, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ExtendNext, window, cx| {
+                let line = this.columns(window) as isize;
+                this.step_selection(line, true, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SelectFirst, window, cx| {
+                this.step_selection(isize::MIN, false, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SelectLast, window, cx| {
+                this.step_selection(isize::MAX, false, window, cx)
+            }))
+            .when(self.view == View::Tiles, |list| {
+                list.on_action(cx.listener(|this, _: &SelectLeft, window, cx| {
+                    this.step_selection(-1, false, window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &SelectRight, window, cx| {
+                    this.step_selection(1, false, window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &ExtendLeft, window, cx| {
+                    this.step_selection(-1, true, window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &ExtendRight, window, cx| {
+                    this.step_selection(1, true, window, cx)
+                }))
+            })
             .on_action(cx.listener(|this, _: &ClearSelection, _, cx| {
                 this.selected.0.clear();
                 this.anchor = None;
@@ -1359,17 +1608,37 @@ impl Render for FileList {
             .child(
                 div()
                     .w_full()
-                    .min_w(dp(160. + self.modified_width + self.size_width))
                     .h_full()
                     .flex()
                     .flex_col()
-                    .child(self.header(cx))
+                    .when(self.view == View::List, |column| {
+                        column
+                            .min_w(dp(160. + self.modified_width + self.size_width))
+                            .child(self.header(cx))
+                    })
                     .child(
-                        uniform_list("files-scroll", self.entries.len(), {
+                        uniform_list("files-scroll", lines, {
                             let list = cx.entity();
                             let numerals = ui::tabular_font();
-                            move |range, _, cx| {
+                            move |range, window, cx| {
                                 let this = list.read(cx);
+                                if this.view == View::Tiles {
+                                    let tiles = Tiles {
+                                        columns,
+                                        width: this.tile_width(columns, window),
+                                        name_width: this.tile_width(columns, window)
+                                            - dp(TILE_NAME_MARGIN).to_pixels(window.rem_size()),
+                                    };
+                                    let mut names = window.text_system().line_wrapper(
+                                        window.text_style().font(),
+                                        dp(text_size::DETAIL).to_pixels(window.rem_size()),
+                                    );
+                                    return range
+                                        .map(|line| {
+                                            tile_line(this, &list, line, &tiles, &mut names)
+                                        })
+                                        .collect();
+                                }
                                 let today = Local::now().date_naive();
                                 range
                                     .map(|index| {
@@ -1427,26 +1696,9 @@ impl Render for FileList {
                                                         Some(renaming)
                                                             if renaming.path == entry.path =>
                                                         {
-                                                            div()
-                                                                .key_context("Rename")
+                                                            rename_field(renaming)
                                                                 .flex_1()
                                                                 .min_w(dp(0.))
-                                                                .h(dp(row::HEIGHT - 6.))
-                                                                .px(dp(4.))
-                                                                .flex()
-                                                                .items_center()
-                                                                .rounded(dp(radius::XS))
-                                                                .bg(rgb(0x101010))
-                                                                .border_1()
-                                                                .border_color(rgb(0x0a84ff))
-                                                                .text_color(rgb(0xeeeeee))
-                                                                .on_mouse_down(
-                                                                    MouseButton::Left,
-                                                                    |_, _, cx| {
-                                                                        cx.stop_propagation()
-                                                                    },
-                                                                )
-                                                                .child(renaming.editor.clone())
                                                         }
                                                         _ => div()
                                                             .flex_1()
@@ -1539,7 +1791,10 @@ impl Render for FileList {
                             .justify_center()
                             .px(dp(20.))
                             .text_color(rgb(0x999999))
-                            .child(message),
+                            .child(match message {
+                                Message::Text(text) => text.into_any_element(),
+                                Message::NoAccess(no_access) => no_access_view(no_access),
+                            }),
                     )
                 })
             })
@@ -1571,6 +1826,184 @@ impl Render for FileList {
                 )
             })
     }
+}
+
+/// A protected folder: what is wrong, where to fix it, and a button there.
+fn no_access_view(no_access: NoAccess) -> gpui::AnyElement {
+    let setting = no_access.setting;
+    div()
+        .flex()
+        .flex_col()
+        .items_center()
+        .max_w(dp(360.))
+        .child(native_icons::symbol("lock", 28.))
+        .child(
+            div()
+                .mt(dp(14.))
+                .text_color(rgb(0xeeeeee))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_center()
+                .child(format!("Filetree can’t open “{}”", no_access.name)),
+        )
+        .child(
+            div()
+                .mt(dp(6.))
+                .text_size(dp(text_size::DETAIL))
+                .text_center()
+                .child(format!(
+                    "Turn on Filetree in Privacy & Security › {}.",
+                    setting.label()
+                )),
+        )
+        .child(
+            div()
+                .id("open-privacy-settings")
+                .mt(dp(16.))
+                .h(dp(28.))
+                .px(dp(14.))
+                .flex()
+                .items_center()
+                .rounded(dp(radius::SM))
+                .bg(rgb(0x3a3a3a))
+                .hover(|button| button.bg(rgb(0x464646)))
+                .active(|button| button.bg(rgb(0x505050)))
+                .text_color(rgb(0xeeeeee))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .cursor_pointer()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(move |_, _, cx| {
+                    cx.stop_propagation();
+                    setting.open();
+                })
+                .child("Open System Settings"),
+        )
+        .into_any_element()
+}
+
+/// The name field shown in place of a name while renaming.
+fn rename_field(renaming: &Renaming) -> gpui::Div {
+    div()
+        .key_context("Rename")
+        .h(dp(row::HEIGHT - 6.))
+        .px(dp(4.))
+        .flex()
+        .items_center()
+        .rounded(dp(radius::XS))
+        .bg(rgb(0x101010))
+        .border_1()
+        .border_color(rgb(0x0a84ff))
+        .text_color(rgb(0xeeeeee))
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .child(renaming.editor.clone())
+}
+
+/// The grid's measurements for one frame.
+struct Tiles {
+    columns: usize,
+    width: Pixels,
+    /// The room a name's text has.
+    name_width: Pixels,
+}
+
+/// A name on up to two lines of `width`: broken where it would wrap, with
+/// the second line cut short by an ellipsis if it still does not fit.
+fn name_lines(
+    name: &SharedString,
+    width: Pixels,
+    wrapper: &mut gpui::LineWrapper,
+) -> (SharedString, Option<SharedString>) {
+    let split = wrapper
+        .wrap_line(&[gpui::LineFragment::text(name)], width)
+        .next()
+        .map(|boundary| boundary.ix)
+        .filter(|ix| *ix > 0 && *ix < name.len());
+    let Some(split) = split else {
+        return (name.clone(), None);
+    };
+    let second = SharedString::from(name[split..].trim_start().to_owned());
+    let second = wrapper.truncate_line(second, width, "…", &mut Vec::new());
+    (name[..split].trim_end().to_owned().into(), Some(second))
+}
+
+/// One line of tiles: large icons or thumbnails, each named beneath. As in
+/// Finder, a selected tile shades its icon and fills its name.
+fn tile_line(
+    this: &FileList,
+    list: &Entity<FileList>,
+    line: usize,
+    tiles: &Tiles,
+    names: &mut gpui::LineWrapper,
+) -> gpui::Stateful<gpui::Div> {
+    let first = line * tiles.columns;
+    let last = (first + tiles.columns).min(this.entries.len());
+    div()
+        .id(("tiles", line))
+        .flex()
+        .h(dp(TILE_HEIGHT))
+        .children((first..last).map(|index| {
+            let entry = &this.entries[this.order[index]];
+            let selected = this.is_selected(index);
+            // While dragged, the selection turns gray so blue only marks
+            // where it will drop.
+            let carried = selected && this.dragging_out.is_some();
+            div()
+                .id(("tile", index))
+                .group("tile")
+                .flex_shrink_0()
+                .w(tiles.width)
+                .h_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .pt(dp(6.))
+                .gap(dp(4.))
+                .child(
+                    div()
+                        .id(("tile-icon", index))
+                        .size(dp(TILE_ICON + 10.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(dp(radius::MD))
+                        .when(selected, |icon| icon.bg(rgb(0x303030)))
+                        .when(!selected, |icon| {
+                            icon.group_hover("tile", |icon| icon.bg(rgb(0x1b2026)))
+                        })
+                        .when(entry.drop_target && !carried, |icon| {
+                            let folder = entry.path.clone();
+                            let list = list.clone();
+                            icon.drag_over::<ExternalPaths>(|icon, _, _, _| icon.bg(rgb(0x1d4f7d)))
+                                .on_drop(move |paths: &ExternalPaths, _, cx| {
+                                    let paths = paths.paths().to_vec();
+                                    let into = Some(folder.clone());
+                                    list.update(cx, |_, cx| cx.emit(Request::Drop { paths, into }));
+                                })
+                        })
+                        .child(native_icons::file_icon(entry.icon.clone(), TILE_ICON)),
+                )
+                .child(match &this.renaming {
+                    Some(renaming) if renaming.path == entry.path => {
+                        rename_field(renaming).w(tiles.name_width)
+                    }
+                    _ => {
+                        let (first, second) = name_lines(&entry.name, tiles.name_width, names);
+                        div()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .px(dp(5.))
+                            .rounded(dp(radius::XS))
+                            .text_size(dp(text_size::DETAIL))
+                            .whitespace_nowrap()
+                            .when(carried, |name| name.bg(rgb(0x303030)))
+                            .when(selected && !carried, |name| {
+                                name.bg(rgb(0x174b78)).text_color(rgb(0xffffff))
+                            })
+                            .child(first)
+                            .children(second)
+                    }
+                })
+        }))
 }
 
 /// Arrow-key selection over `len` rows: the selected range, the new anchor,
