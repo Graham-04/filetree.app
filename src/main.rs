@@ -1,4 +1,6 @@
 use std::{
+    cell::RefCell,
+    collections::HashMap,
     path::{Path, PathBuf},
     rc::Rc,
     sync::{Arc, atomic::AtomicBool},
@@ -18,6 +20,7 @@ mod file_ops;
 mod folder_cache;
 mod history;
 mod native_icons;
+mod panes;
 mod path_completion;
 mod quick_look;
 use file_list::{FileEntry, FileList};
@@ -50,6 +53,9 @@ actions!(
     filetree,
     [
         NewTab,
+        SplitRight,
+        SplitDown,
+        MovePaneToTab,
         CloseTab,
         ToggleSidebar,
         ToggleFavorites,
@@ -138,6 +144,61 @@ struct BrowserTab {
     live: LiveRefresh,
 }
 
+/// A tab of several panes. Its panes are tabs that left the tab bar to join
+/// it, arranged by `layout`; each keeps its own folder, history, search, and
+/// selection, and the focused one is the active tab.
+struct Group {
+    layout: panes::Layout<u64>,
+    /// The pane focused last, which the tab is named for and returns to.
+    focus: u64,
+}
+
+/// A tab being dragged: to another place in the tab bar, or onto the files
+/// to show it beside the active tab.
+#[derive(Clone)]
+struct DraggedTab {
+    id: u64,
+    title: SharedString,
+}
+
+/// What follows the pointer while a tab is dragged: a small copy of the tab.
+struct DraggedTabPreview {
+    title: SharedString,
+    /// Where the tab was grabbed, from its corner. GPUI draws the preview that
+    /// far up and left of the pointer, as if it were the whole tab.
+    grabbed: gpui::Point<gpui::Pixels>,
+}
+
+impl Render for DraggedTabPreview {
+    fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        // The copy is narrower than the tab, so pad it back under the pointer,
+        // a little up and left of it.
+        let near = dp(12.).to_pixels(window.rem_size());
+        div()
+            .pl((self.grabbed.x - near).max(px(0.)))
+            .pt((self.grabbed.y - near).max(px(0.)))
+            .child(self.chip())
+    }
+}
+
+impl DraggedTabPreview {
+    fn chip(&self) -> gpui::Div {
+        div()
+            .h(dp(28.))
+            .px(dp(12.))
+            .flex()
+            .items_center()
+            .rounded(dp(radius::MD))
+            .bg(rgb(0x353535))
+            .border_1()
+            .border_color(rgb(0x4a4a4a))
+            .shadow_lg()
+            .text_size(dp(text_size::DETAIL))
+            .text_color(rgb(0xeeeeee))
+            .child(self.title.clone())
+    }
+}
+
 /// Re-reading a tab's folder after another app changed it.
 #[derive(Default)]
 struct LiveRefresh {
@@ -162,6 +223,9 @@ enum Command {
     ArrowsFolderPath,
     ViewList,
     ViewTiles,
+    SplitRight,
+    SplitDown,
+    MovePaneToTab,
     ResetZoom,
     ClearIndex,
 }
@@ -176,6 +240,9 @@ impl Command {
             Self::ArrowsFolderPath => "⌘← ⌘→ Move Along the Folder Path",
             Self::ViewList => "View as List",
             Self::ViewTiles => "View as Tiles",
+            Self::SplitRight => "Split Right",
+            Self::SplitDown => "Split Down",
+            Self::MovePaneToTab => "Move Pane to New Tab",
             Self::ResetZoom => "Reset to Default Zoom",
             Self::ClearIndex => "Clear File Index",
         }
@@ -187,6 +254,8 @@ impl Command {
             Self::Sounds | Self::CheckForUpdates => None,
             Self::ArrowsHistory | Self::ArrowsFolderPath => None,
             Self::ViewList | Self::ViewTiles => None,
+            Self::SplitRight => Some("⌘\\"),
+            Self::SplitDown | Self::MovePaneToTab => None,
             Self::ResetZoom => Some("⌘0"),
             Self::ClearIndex => None,
         }
@@ -201,6 +270,9 @@ impl Command {
             Self::ArrowsFolderPath => "arrow.up.and.down.text.horizontal",
             Self::ViewList => "list.bullet.rectangle",
             Self::ViewTiles => "square.grid.3x2",
+            Self::SplitRight => "rectangle.split.2x1",
+            Self::SplitDown => "rectangle.split.1x2",
+            Self::MovePaneToTab => "macwindow.badge.plus",
             Self::ResetZoom => "arrow.counterclockwise",
             Self::ClearIndex => "trash",
         }
@@ -215,6 +287,9 @@ impl Command {
             Self::ArrowsFolderPath => Box::new(ArrowKeysFolderPath),
             Self::ViewList => Box::new(ViewAsList),
             Self::ViewTiles => Box::new(ViewAsTiles),
+            Self::SplitRight => Box::new(SplitRight),
+            Self::SplitDown => Box::new(SplitDown),
+            Self::MovePaneToTab => Box::new(MovePaneToTab),
             Self::ResetZoom => Box::new(ResetZoom),
             Self::ClearIndex => Box::new(ClearFileIndex),
         }
@@ -227,8 +302,8 @@ enum MenuItem {
 }
 
 /// The commands matching `query`; Check for Updates only in builds that
-/// update themselves.
-fn matching_commands(query: &str, updates: bool) -> Vec<Command> {
+/// update themselves, and Move Pane to New Tab only in a tab of panes.
+fn matching_commands(query: &str, updates: bool, in_panes: bool) -> Vec<Command> {
     [
         Command::Settings,
         Command::HiddenFiles,
@@ -238,11 +313,15 @@ fn matching_commands(query: &str, updates: bool) -> Vec<Command> {
         Command::ArrowsFolderPath,
         Command::ViewList,
         Command::ViewTiles,
+        Command::SplitRight,
+        Command::SplitDown,
+        Command::MovePaneToTab,
         Command::ResetZoom,
         Command::ClearIndex,
     ]
     .into_iter()
     .filter(|command| updates || !matches!(command, Command::CheckForUpdates))
+    .filter(|command| in_panes || !matches!(command, Command::MovePaneToTab))
     .filter(|command| {
         let haystack = match command {
             Command::Settings => "settings preferences storage file index size disk",
@@ -255,6 +334,9 @@ fn matching_commands(query: &str, updates: bool) -> Vec<Command> {
             }
             Command::ViewList => "view as list rows details columns layout",
             Command::ViewTiles => "view as tiles icons grid thumbnails gallery layout",
+            Command::SplitRight => "split right pane side by side columns view dual",
+            Command::SplitDown => "split down pane below stacked rows view",
+            Command::MovePaneToTab => "move pane to new tab separate split unsplit detach",
             Command::ResetZoom => "reset to default zoom appearance 100%",
             Command::ClearIndex => "clear file index fsearch rebuild cache search",
         };
@@ -303,6 +385,17 @@ struct FileBrowser {
     tabs: Vec<BrowserTab>,
     active_tab: usize,
     tab_scroll: ScrollHandle,
+    /// The command menu's list, scrolled to keep the selection in view.
+    command_scroll: ScrollHandle,
+    /// Tabs of several panes, each shown as one tab in the tab bar.
+    groups: Vec<Group>,
+    /// The divider being dragged, in the active tab's layout.
+    resizing_split: Option<(panes::Path, panes::Axis)>,
+    /// Where each split of the active tab's layout was last drawn, to follow
+    /// a dragged divider.
+    split_bounds: Rc<RefCell<HashMap<panes::Path, gpui::Bounds<gpui::Pixels>>>>,
+    /// The pane a dragged tab would join, and on which side.
+    drop_target: Option<(u64, panes::Side)>,
     focus: FocusHandle,
     command_menu_open: bool,
     context_menu: Option<ContextMenu>,
@@ -371,6 +464,7 @@ impl FileBrowser {
         .detach();
         cx.subscribe(&command_search, |this, _, _: &search_input::Changed, cx| {
             this.selected_command = 0;
+            this.command_scroll.scroll_to_item(0);
             let query = this.command_search.read(cx).text().to_owned();
             this.read_children_for(&query, cx);
             cx.notify();
@@ -462,6 +556,11 @@ impl FileBrowser {
             }],
             active_tab: 0,
             tab_scroll: ScrollHandle::new(),
+            command_scroll: ScrollHandle::new(),
+            groups: Vec::new(),
+            resizing_split: None,
+            split_bounds: Default::default(),
+            drop_target: None,
             focus: cx.focus_handle(),
             command_menu_open: false,
             context_menu: None,
@@ -499,6 +598,21 @@ impl FileBrowser {
             browser.refresh_tab(browser.tabs.len() - 1, cx);
         }
         browser.active_tab = session.active_tab.min(browser.tabs.len() - 1);
+        for saved in &session.groups {
+            let layout = saved.map(&|position| browser.tabs.get(position).map(|tab| tab.id));
+            let Some(layout) = layout else { continue };
+            let panes = layout.panes();
+            let distinct = panes.iter().collect::<std::collections::HashSet<_>>().len();
+            if panes.len() > 1
+                && distinct == panes.len()
+                && panes.iter().all(|&pane| browser.group_of(pane).is_none())
+            {
+                browser.groups.push(Group {
+                    focus: panes[0],
+                    layout,
+                });
+            }
+        }
         browser._session_hooks = vec![
             cx.observe_window_bounds(window, |this, window, _| {
                 this.window_frame = window_frame(window);
@@ -528,6 +642,11 @@ impl FileBrowser {
             zoom: self.zoom.saved(),
             sidebar: self.sidebar.state(),
             recent: self.recent.iter().map(|(path, _)| path.clone()).collect(),
+            groups: self
+                .groups
+                .iter()
+                .filter_map(|group| group.layout.map(&|id| self.tab_index(id)))
+                .collect(),
         };
         if let Err(error) = storage::save(&self.session_path, &session) {
             eprintln!("Could not save session: {error:#}");
@@ -903,7 +1022,7 @@ impl FileBrowser {
                 continue;
             }
             self.folders.remove(&tab.location.clone());
-            if index == self.active_tab {
+            if self.shown_tabs().contains(&index) {
                 self.live_refresh(index, cx);
             } else {
                 self.tabs[index].live.stale = true;
@@ -1116,13 +1235,243 @@ impl FileBrowser {
             .list
             .update(cx, |list, cx| list.end_drag(cx));
         self.active_tab = index;
+        let id = self.tabs[index].id;
+        if let Some(group) = self.group_of(id) {
+            self.groups[group].focus = id;
+        }
         self.focus_list(window, cx);
         self.sync_search(cx);
-        self.tab_scroll.scroll_to_item(index);
-        if std::mem::take(&mut self.tabs[index].live.stale) {
-            self.refresh_tab_inner(index, true, cx);
+        self.tab_scroll.scroll_to_item(self.bar_position(index));
+        for shown in self.shown_tabs() {
+            if std::mem::take(&mut self.tabs[shown].live.stale) {
+                self.refresh_tab_inner(shown, true, cx);
+            }
         }
         cx.notify();
+    }
+
+    fn tab_index(&self, id: u64) -> Option<usize> {
+        self.tabs.iter().position(|tab| tab.id == id)
+    }
+
+    /// Which of `groups` tab `id` is a pane of.
+    fn group_of(&self, id: u64) -> Option<usize> {
+        self.groups
+            .iter()
+            .position(|group| group.layout.contains(id))
+    }
+
+    /// The tabs on screen in reading order: the active one, and the other
+    /// panes of its tab.
+    fn shown_tabs(&self) -> Vec<usize> {
+        let active = self.tabs[self.active_tab].id;
+        match self.group_of(active) {
+            Some(group) => self.groups[group]
+                .layout
+                .panes()
+                .into_iter()
+                .filter_map(|id| self.tab_index(id))
+                .collect(),
+            None => vec![self.active_tab],
+        }
+    }
+
+    /// The tab bar's items in order, as tab indices: a tab, or all the panes
+    /// of one, where its first pane sits in `tabs`.
+    fn bar_items(&self) -> Vec<Vec<usize>> {
+        let mut seen = std::collections::HashSet::new();
+        let mut items = Vec::new();
+        for (index, tab) in self.tabs.iter().enumerate() {
+            match self.group_of(tab.id) {
+                Some(group) if seen.insert(group) => items.push(
+                    self.groups[group]
+                        .layout
+                        .panes()
+                        .into_iter()
+                        .filter_map(|id| self.tab_index(id))
+                        .collect(),
+                ),
+                Some(_) => {}
+                None => items.push(vec![index]),
+            }
+        }
+        items
+    }
+
+    /// Where tab `index` sits in the tab bar.
+    fn bar_position(&self, index: usize) -> usize {
+        self.bar_items()
+            .iter()
+            .position(|item| item.contains(&index))
+            .unwrap_or(0)
+    }
+
+    /// The pane a tab bar item is named for and opens to: its only tab, or
+    /// the pane of it focused last.
+    fn item_focus(&self, item: &[usize]) -> usize {
+        let focus = self
+            .group_of(self.tabs[item[0]].id)
+            .map(|group| self.groups[group].focus);
+        item.iter()
+            .copied()
+            .find(|&index| Some(self.tabs[index].id) == focus)
+            .unwrap_or(item[0])
+    }
+
+    /// Shows the tab bar's `position`th item; ⌘1 to ⌘9.
+    fn select_item(&mut self, position: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let items = self.bar_items();
+        let Some(item) = items.get(position.min(items.len().saturating_sub(1))) else {
+            return;
+        };
+        if !item.contains(&self.active_tab) {
+            let index = self.item_focus(item);
+            self.select_tab(index, window, cx);
+        }
+    }
+
+    /// Makes tab `new` a pane of `target`'s tab, on `side` of pane `target`,
+    /// and focuses it. Only a tab of one pane can join, and a tab holds at
+    /// most `panes::LIMIT`.
+    fn join(
+        &mut self,
+        target: u64,
+        new: u64,
+        side: panes::Side,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if target == new || self.group_of(new).is_some() || self.tab_index(target).is_none() {
+            return;
+        }
+        let members = match self.group_of(target) {
+            Some(group) => self.groups[group].layout.panes(),
+            None => vec![target],
+        };
+        if members.len() >= panes::LIMIT {
+            ui::beep();
+            return;
+        }
+        // Keep a tab's panes together in `tabs`: the new one after the rest.
+        let last = members
+            .iter()
+            .filter_map(|&id| self.tab_index(id))
+            .max()
+            .unwrap_or(0);
+        let after = self
+            .tabs
+            .get(last + 1)
+            .map(|tab| tab.id)
+            .filter(|&id| id != new);
+        if self.tab_index(new) != Some(last + 1) {
+            self.move_item(new, after);
+        }
+        let group = match self.group_of(target) {
+            Some(group) => group,
+            None => {
+                self.groups.push(Group {
+                    layout: panes::Layout::Pane(target),
+                    focus: target,
+                });
+                self.groups.len() - 1
+            }
+        };
+        self.groups[group].layout.insert(target, new, side);
+        if let Some(index) = self.tab_index(new) {
+            self.select_tab(index, window, cx);
+        }
+        self.save_session();
+        cx.notify();
+    }
+
+    /// Takes tab `id` out of its tab's panes, giving its room to a
+    /// neighbor. A tab left with one pane is an ordinary tab again.
+    fn leave_group(&mut self, id: u64) {
+        let Some(group) = self.group_of(id) else {
+            return;
+        };
+        let layout = &mut self.groups[group].layout;
+        layout.remove(id);
+        let panes = layout.panes();
+        if panes.len() < 2 {
+            self.groups.remove(group);
+        } else if self.groups[group].focus == id {
+            self.groups[group].focus = panes[0];
+        }
+    }
+
+    /// Adds a pane showing the focused pane's folder on `side` of it.
+    fn split_pane(&mut self, side: panes::Side, window: &mut Window, cx: &mut Context<Self>) {
+        self.command_menu_open = false;
+        let active = self.tabs[self.active_tab].id;
+        let count = self
+            .group_of(active)
+            .map_or(1, |group| self.groups[group].layout.panes().len());
+        if count >= panes::LIMIT {
+            ui::beep();
+            return;
+        }
+        let location = self.tabs[self.active_tab].location.clone();
+        self.open_tab(location, window, cx);
+        let new = self.tabs[self.active_tab].id;
+        self.join(active, new, side, window, cx);
+    }
+
+    /// Moves the focused pane out to a tab of its own, after its old tab.
+    fn move_pane_to_tab(&mut self, _: &MovePaneToTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.command_menu_open = false;
+        let active = self.tabs[self.active_tab].id;
+        let Some(group) = self.group_of(active) else {
+            return;
+        };
+        let others: Vec<u64> = self.groups[group]
+            .layout
+            .panes()
+            .into_iter()
+            .filter(|&id| id != active)
+            .collect();
+        self.leave_group(active);
+        let last = others
+            .iter()
+            .filter_map(|&id| self.tab_index(id))
+            .max()
+            .unwrap_or(0);
+        let after = self.tabs.get(last + 1).map(|tab| tab.id);
+        self.move_item(active, after);
+        if let Some(index) = self.tab_index(active) {
+            self.select_tab(index, window, cx);
+        }
+        self.save_session();
+        cx.notify();
+    }
+
+    /// Moves tab `id`'s tab bar item (all its panes) to just before tab
+    /// `before`, or to the end, keeping the active tab active.
+    fn move_item(&mut self, id: u64, before: Option<u64>) {
+        let mut ids: Vec<u64> = match self.group_of(id) {
+            Some(group) => self.groups[group].layout.panes(),
+            None => vec![id],
+        };
+        ids.sort_by_key(|&id| self.tab_index(id));
+        if before.is_some_and(|before| ids.contains(&before)) {
+            return;
+        }
+        let active = self.tabs[self.active_tab].id;
+        let mut moved = Vec::new();
+        for id in &ids {
+            if let Some(index) = self.tab_index(*id) {
+                moved.push(self.tabs.remove(index));
+            }
+        }
+        let at = before
+            .and_then(|before| self.tab_index(before))
+            .unwrap_or(self.tabs.len());
+        for (offset, tab) in moved.into_iter().enumerate() {
+            self.tabs.insert(at + offset, tab);
+        }
+        self.active_tab = self.tab_index(active).unwrap_or(0);
+        self.tab_scroll
+            .scroll_to_item(self.bar_position(self.active_tab));
     }
 
     fn handle_list_request(
@@ -1932,8 +2281,286 @@ impl FileBrowser {
             })
     }
 
-    fn path_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let tab = &self.tabs[self.active_tab];
+    /// The active tab's files, or all of its panes as arranged, each with its
+    /// own path bar. Clicking a pane focuses it; dragging a line between panes
+    /// resizes them; dragging a tab over a pane offers to add it there, on
+    /// the side nearest the pointer.
+    fn panes(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let active = self.tabs[self.active_tab].id;
+        let group = self.group_of(active);
+        let layout = match group {
+            Some(group) => self.groups[group].layout.clone(),
+            None => panes::Layout::Pane(active),
+        };
+        if let Some((path, axis)) = self.resizing_split.clone() {
+            let browser = cx.entity();
+            window.on_mouse_event({
+                let browser = browser.clone();
+                move |event: &gpui::MouseMoveEvent, phase, _, cx| {
+                    if phase != gpui::DispatchPhase::Bubble {
+                        return;
+                    }
+                    browser.update(cx, |this, cx| {
+                        let Some(bounds) = this.split_bounds.borrow().get(&path).copied() else {
+                            return;
+                        };
+                        let share = match axis {
+                            panes::Axis::Row => {
+                                f32::from(event.position.x - bounds.origin.x)
+                                    / f32::from(bounds.size.width).max(1.)
+                            }
+                            panes::Axis::Column => {
+                                f32::from(event.position.y - bounds.origin.y)
+                                    / f32::from(bounds.size.height).max(1.)
+                            }
+                        };
+                        let active = this.tabs[this.active_tab].id;
+                        if let Some(group) = this.group_of(active) {
+                            this.groups[group].layout.resize(&path, share);
+                            cx.notify();
+                        }
+                    });
+                }
+            });
+            window.on_mouse_event(move |_: &gpui::MouseUpEvent, phase, _, cx| {
+                if phase == gpui::DispatchPhase::Bubble {
+                    browser.update(cx, |this, cx| {
+                        this.resizing_split = None;
+                        this.save_session();
+                        cx.notify();
+                    });
+                }
+            });
+        }
+        // A dragged tab can join: a tab of one pane, into a tab with room.
+        let droppable = cx.active_drag_value::<DraggedTab>().is_some_and(|dragged| {
+            !layout.contains(dragged.id)
+                && self.group_of(dragged.id).is_none()
+                && layout.panes().len() < panes::LIMIT
+        });
+        let top_right = layout.top_right();
+        div()
+            .id("panes")
+            .flex()
+            .flex_1()
+            .min_h(dp(0.))
+            .min_w(dp(0.))
+            .child(self.layout_view(&layout, Vec::new(), top_right, droppable, cx))
+    }
+
+    /// One part of the active tab's layout: a pane, or a split of two parts
+    /// with the line between them.
+    fn layout_view(
+        &self,
+        layout: &panes::Layout<u64>,
+        path: panes::Path,
+        top_right: u64,
+        droppable: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        match layout {
+            panes::Layout::Pane(id) => self.pane_view(*id, top_right, droppable, cx),
+            panes::Layout::Split {
+                axis,
+                share,
+                first,
+                second,
+            } => {
+                let (axis, share) = (*axis, *share);
+                let row = axis == panes::Axis::Row;
+                let mut part = |part: &panes::Layout<u64>, in_second: bool| {
+                    let mut path = path.clone();
+                    path.push(in_second);
+                    div()
+                        .flex()
+                        .min_w(dp(0.))
+                        .min_h(dp(0.))
+                        .child(self.layout_view(part, path, top_right, droppable, cx))
+                };
+                let bounds = self.split_bounds.clone();
+                let key = path.clone();
+                let divider_path = path.clone();
+                div()
+                    .id((
+                        "split",
+                        path.iter()
+                            .fold(1_u64, |id, &in_second| id * 2 + in_second as u64),
+                    ))
+                    .relative()
+                    .flex()
+                    .when(!row, |split| split.flex_col())
+                    .flex_1()
+                    .min_w(dp(0.))
+                    .min_h(dp(0.))
+                    .child(
+                        gpui::canvas(
+                            move |area, _, _| {
+                                bounds.borrow_mut().insert(key.clone(), area);
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .inset_0(),
+                    )
+                    .child(
+                        part(first, false)
+                            .flex_shrink_0()
+                            .border_color(rgb(0x262626))
+                            .map(|part| {
+                                if row {
+                                    part.w(gpui::relative(share)).border_r_1()
+                                } else {
+                                    part.h(gpui::relative(share)).border_b_1()
+                                }
+                            }),
+                    )
+                    .child(part(second, true).flex_1())
+                    // Over the parts, so its grab area reaches into both.
+                    .child(
+                        div()
+                            .id("divider")
+                            .absolute()
+                            .map(|divider| {
+                                if row {
+                                    divider
+                                        .top_0()
+                                        .bottom_0()
+                                        .left(gpui::relative(share))
+                                        .ml(dp(-4.))
+                                        .w(dp(8.))
+                                        .cursor(gpui::CursorStyle::ResizeLeftRight)
+                                } else {
+                                    divider
+                                        .left_0()
+                                        .right_0()
+                                        .top(gpui::relative(share))
+                                        .mt(dp(-4.))
+                                        .h(dp(8.))
+                                        .cursor(gpui::CursorStyle::ResizeUpDown)
+                                }
+                            })
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.resizing_split = Some((divider_path.clone(), axis));
+                                    cx.notify();
+                                }),
+                            ),
+                    )
+                    .into_any_element()
+            }
+        }
+    }
+
+    /// One pane: its path bar and files, focused by any click in it. While a
+    /// tab that can join is dragged over it, the half nearest the pointer
+    /// lights up where the tab would go.
+    fn pane_view(
+        &self,
+        id: u64,
+        top_right: u64,
+        droppable: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let Some(index) = self.tab_index(id) else {
+            return div().into_any_element();
+        };
+        let target = self.drop_target.filter(|(pane, _)| *pane == id);
+        div()
+            .id(("pane", id))
+            .relative()
+            .flex_1()
+            .min_w(dp(0.))
+            .min_h(dp(0.))
+            .flex()
+            .flex_col()
+            // Focus first, so the click then acts in this pane.
+            .capture_any_mouse_down(cx.listener(move |this, _, window, cx| {
+                if this.active_tab != index {
+                    this.select_tab(index, window, cx);
+                }
+            }))
+            .child(self.path_bar(index, id == top_right, cx))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h(dp(0.))
+                    .child(self.tabs[index].list.clone()),
+            )
+            .when(droppable, |pane| {
+                pane.child(
+                    div()
+                        .id("pane-drop")
+                        .absolute()
+                        .inset_0()
+                        .on_drag_move::<DraggedTab>(cx.listener(
+                            move |this, event: &gpui::DragMoveEvent<DraggedTab>, _, cx| {
+                                let bounds = event.bounds;
+                                let position = event.event.position;
+                                let next = if bounds.contains(&position) {
+                                    let x = f32::from(position.x - bounds.origin.x)
+                                        / f32::from(bounds.size.width).max(1.);
+                                    let y = f32::from(position.y - bounds.origin.y)
+                                        / f32::from(bounds.size.height).max(1.);
+                                    Some((id, panes::Side::nearest(x, y)))
+                                } else if this.drop_target.is_some_and(|(pane, _)| pane == id) {
+                                    None
+                                } else {
+                                    this.drop_target
+                                };
+                                if this.drop_target != next {
+                                    this.drop_target = next;
+                                    cx.notify();
+                                }
+                            },
+                        ))
+                        .on_drop(cx.listener(move |this, dragged: &DraggedTab, window, cx| {
+                            let side = this
+                                .drop_target
+                                .take()
+                                .filter(|(pane, _)| *pane == id)
+                                .map_or(panes::Side::Right, |(_, side)| side);
+                            this.join(id, dragged.id, side, window, cx);
+                        }))
+                        .when_some(target, |zone, (_, side)| {
+                            let half = div()
+                                .absolute()
+                                .rounded(dp(radius::MD))
+                                .bg(gpui::rgba(0x0a84ff2e))
+                                .border_2()
+                                .border_color(rgb(0x0a84ff));
+                            zone.child(match side {
+                                panes::Side::Left => {
+                                    half.top_0().bottom_0().left_0().w(gpui::relative(0.5))
+                                }
+                                panes::Side::Right => {
+                                    half.top_0().bottom_0().right_0().w(gpui::relative(0.5))
+                                }
+                                panes::Side::Top => {
+                                    half.left_0().right_0().top_0().h(gpui::relative(0.5))
+                                }
+                                panes::Side::Bottom => {
+                                    half.left_0().right_0().bottom_0().h(gpui::relative(0.5))
+                                }
+                            })
+                        }),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// `tab_index`'s path bar. `controls` adds the view and split buttons, on
+    /// the rightmost pane only.
+    fn path_bar(
+        &self,
+        tab_index: usize,
+        controls: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let tab = &self.tabs[tab_index];
+        // Beside a split pane, the focused one's folder reads brighter.
+        let focused = tab_index == self.active_tab;
         let mut segments = path_segments(&tab.location, &self.home);
         let last = segments.len().saturating_sub(1);
         // With the arrows following the folder path, the folders ⌘→ returns
@@ -1947,7 +2574,7 @@ impl FileBrowser {
                 (label, path)
             }));
         }
-        let editing = self.path_edit.is_some();
+        let editing = focused && self.path_edit.is_some();
         div()
             .id("path-bar")
             .flex()
@@ -2019,8 +2646,10 @@ impl FileBrowser {
                                     .px(dp(6.))
                                     .min_w(dp(0.))
                                     .rounded(dp(radius::SM))
-                                    .text_color(rgb(if current {
+                                    .text_color(rgb(if current && focused {
                                         0xeeeeee
+                                    } else if current {
+                                        0xbbbbbb
                                     } else if index > last {
                                         0x666666
                                     } else {
@@ -2051,44 +2680,75 @@ impl FileBrowser {
                         )),
                 )
             })
-            .child(self.view_toggle(cx))
+            .when(controls, |bar| bar.child(self.view_toggle(cx)))
+            .child(self.pane_controls(tab_index, cx))
     }
 
-    /// Rows or tiles, at the path bar's right end.
+    /// Rows or tiles, at the right end of the top right pane's path bar.
     fn view_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let option = |view: storage::View, symbol: &'static str, tip: &'static str| {
-            let chosen = self.settings.view == view;
-            div()
-                .id(tip)
-                .size(dp(24.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(dp(radius::SM))
-                .when(chosen, |button| button.bg(rgb(0x303030)))
-                .when(!chosen, |button| {
-                    button
-                        .cursor_pointer()
-                        .hover(|button| button.bg(rgb(0x252525)))
-                })
-                .tooltip(ui::tooltip(tip))
-                .on_click(cx.listener(move |this, _, window, cx| {
+        let view = |view: storage::View, symbol: &'static str, tip: &'static str| {
+            path_bar_button(tip, symbol, self.settings.view == view, true).on_click(cx.listener(
+                move |this, _, window, cx| {
                     cx.stop_propagation();
                     this.set_view(view, window, cx);
-                }))
-                .child(native_icons::symbol(symbol, 14.))
+                },
+            ))
         };
         div()
             .flex()
             .flex_shrink_0()
+            .items_center()
             .gap(dp(2.))
             .ml(dp(8.))
-            .child(option(storage::View::List, "list.bullet", "View as List"))
-            .child(option(
+            .child(view(storage::View::List, "list.bullet", "View as List"))
+            .child(view(
                 storage::View::Tiles,
                 "rectangle.grid.2x2",
                 "View as Tiles",
             ))
+            .child(div().w(px(1.)).h(dp(14.)).mx(dp(4.)).bg(rgb(0x333333)))
+    }
+
+    /// Every pane's own corner controls: split it right or down, and, in a
+    /// tab of several panes, close it.
+    fn pane_controls(&self, tab_index: usize, cx: &mut Context<Self>) -> impl IntoElement {
+        let id = self.tabs[tab_index].id;
+        let group = self.group_of(id);
+        let room = group.is_none_or(|group| self.groups[group].layout.panes().len() < panes::LIMIT);
+        let split = |tip: &'static str, symbol: &'static str, side: panes::Side| {
+            path_bar_button(tip, symbol, false, room).when(room, |button| {
+                button.on_click(cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.split_pane(side, window, cx);
+                }))
+            })
+        };
+        div()
+            .flex()
+            .flex_shrink_0()
+            .items_center()
+            .gap(dp(2.))
+            .ml(dp(4.))
+            .child(split(
+                "Split Right",
+                "rectangle.split.2x1",
+                panes::Side::Right,
+            ))
+            .child(split(
+                "Split Down",
+                "rectangle.split.1x2",
+                panes::Side::Bottom,
+            ))
+            .when(group.is_some(), |controls| {
+                controls.child(
+                    path_bar_button("Close Pane", "xmark", false, true).on_click(cx.listener(
+                        move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.close_tab(tab_index, window, cx);
+                        },
+                    )),
+                )
+            })
     }
 
     fn open_search(&mut self, _: &OpenSearch, window: &mut Window, cx: &mut Context<Self>) {
@@ -2227,7 +2887,8 @@ impl FileBrowser {
         self.sync_search(cx);
         self.refresh_tab(self.active_tab, cx);
         self.focus_list(window, cx);
-        self.tab_scroll.scroll_to_item(self.active_tab);
+        self.tab_scroll
+            .scroll_to_item(self.bar_position(self.active_tab));
         cx.notify();
     }
 
@@ -2246,15 +2907,179 @@ impl FileBrowser {
         self.command_menu_open = false;
         self.settings_open = false;
         self.focus.focus(window);
+        let closed = self.tabs[index].id;
+        let active = self.tabs[self.active_tab].id;
+        // Closing the focused pane of a tab focuses another of its panes.
+        let sibling = self.group_of(closed).and_then(|group| {
+            self.groups[group]
+                .layout
+                .panes()
+                .into_iter()
+                .find(|&id| id != closed)
+        });
+        self.leave_group(closed);
         self.tabs.remove(index);
         self.sync_watched();
-        if index < self.active_tab || self.active_tab == self.tabs.len() {
-            self.active_tab -= 1;
+        let next = if closed == active {
+            sibling
+        } else {
+            Some(active)
+        };
+        match next.and_then(|id| self.tab_index(id)) {
+            Some(next) => self.active_tab = next,
+            None if index < self.active_tab || self.active_tab == self.tabs.len() => {
+                self.active_tab -= 1;
+            }
+            None => {}
+        }
+        if let Some(group) = self.group_of(self.tabs[self.active_tab].id) {
+            self.groups[group].focus = self.tabs[self.active_tab].id;
         }
         self.focus_list(window, cx);
         self.sync_search(cx);
-        self.tab_scroll.scroll_to_item(self.active_tab);
+        self.tab_scroll
+            .scroll_to_item(self.bar_position(self.active_tab));
         cx.notify();
+    }
+
+    /// The tab bar's label for a tab, or for a search in it.
+    fn tab_title(&self, index: usize) -> String {
+        let tab = &self.tabs[index];
+        if tab.query.is_empty() {
+            tab.location
+                .file_name()
+                .unwrap_or(tab.location.as_os_str())
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            format!("Search: {}", tab.query)
+        }
+    }
+
+    /// One tab in the tab bar, named for its pane, or for a split's focused
+    /// pane. `next` is the first tab of the item after it, for a drop on this
+    /// one's right half; `dragging` the tab being dragged. A lone tab has
+    /// nowhere to move and nothing to join, so it does not drag.
+    fn tab_item(
+        &self,
+        item: &[usize],
+        next: Option<u64>,
+        width: f32,
+        dragging: Option<u64>,
+        draggable: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let first = self.tabs[item[0]].id;
+        let index = self.item_focus(item);
+        let active = item.contains(&self.active_tab);
+        let show_close = width >= 100. || active;
+        let title = self.tab_title(index);
+        let target = self.tabs[index].location.clone();
+        let ids: Vec<u64> = item.iter().map(|&index| self.tabs[index].id).collect();
+        let dragged = DraggedTab {
+            id: first,
+            title: title.clone().into(),
+        };
+        div()
+            .id(("tab", first))
+            .relative()
+            .flex()
+            .flex_1()
+            .min_w(dp(36.))
+            .px(dp(4.))
+            .h_full()
+            .items_center()
+            .justify_center()
+            .rounded(dp(radius::MD))
+            .bg(rgb(if active { 0x353535 } else { 0x222222 }))
+            .text_color(rgb(if active { 0xeeeeee } else { 0xaaaaaa }))
+            .cursor_pointer()
+            .drag_over::<ExternalPaths>(|tab, _, _, _| tab.bg(rgb(0x1d4f7d)))
+            .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
+                this.drop_files(paths.paths().to_vec(), target.clone(), cx)
+            }))
+            .when(draggable, |tab| {
+                tab.on_drag(dragged, |tab, grabbed, _, cx| {
+                    cx.new(|_| DraggedTabPreview {
+                        title: tab.title.clone(),
+                        grabbed,
+                    })
+                })
+            })
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.select_tab(index, window, cx);
+            }))
+            .when(width >= 70., |tab| {
+                tab.child(
+                    div()
+                        .flex_1()
+                        .min_w(dp(0.))
+                        .text_center()
+                        .text_ellipsis()
+                        .child(title),
+                )
+            })
+            .when(width < 70. && !show_close, |tab| {
+                tab.child(div().size(dp(8.)).rounded_full().bg(rgb(0x0a84ff)))
+            })
+            .when(show_close, |tab| {
+                let ids = ids.clone();
+                tab.child(
+                    div()
+                        .id(("close-tab", first))
+                        .size(dp(24.))
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(dp(radius::SM))
+                        .hover(|button| button.bg(rgb(0x4a4a4a)))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            // A split tab closes with all of its panes.
+                            for id in ids.iter().rev() {
+                                if let Some(index) = this.tab_index(*id) {
+                                    this.close_tab(index, window, cx);
+                                }
+                            }
+                        }))
+                        .child(native_icons::symbol("xmark", 10.)),
+                )
+            })
+            // While another tab is dragged: drop on this one's left half to
+            // put it before, on the right half to put it after.
+            .when(
+                dragging.is_some_and(|dragged| !ids.contains(&dragged)),
+                |tab| {
+                    let half = |id: &'static str, right: bool| {
+                        let before = if right { next } else { Some(first) };
+                        div()
+                            .id(id)
+                            .absolute()
+                            .top_0()
+                            .bottom_0()
+                            .w(gpui::relative(0.5))
+                            .map(|zone| if right { zone.right_0() } else { zone.left_0() })
+                            .drag_over::<DraggedTab>(move |zone, _, _, _| {
+                                let zone = zone.border_color(rgb(0x0a84ff));
+                                if right {
+                                    zone.border_r_2()
+                                } else {
+                                    zone.border_l_2()
+                                }
+                            })
+                            .on_drop(cx.listener(move |this, dragged: &DraggedTab, _, cx| {
+                                this.move_item(dragged.id, before);
+                                this.save_session();
+                                cx.notify();
+                            }))
+                    };
+                    tab.child(half("drop-before", false))
+                        .child(half("drop-after", true))
+                },
+            )
+            .into_any_element()
     }
 
     fn tab_row(
@@ -2272,9 +3097,15 @@ impl FileBrowser {
             - sidebar_width.max(controls_width)
             // The new-tab and search buttons, their gaps, and the right padding.
             - (NEW_TAB + search_width + 14.) * scale;
-        let width = ((available / scale - 4. * (self.tabs.len() - 1) as f32)
-            / self.tabs.len() as f32)
-            .max(36.);
+        let count = self.bar_items().len();
+        let width = ((available / scale - 4. * (count - 1) as f32) / count as f32).max(36.);
+        let items = self.bar_items();
+        // While a tab is dragged, every other item offers its edges (move
+        // there) and, if it is a single tab, its middle (split with it).
+        let dragging = cx
+            .active_drag_value::<DraggedTab>()
+            .map(|dragged| dragged.id);
+        let firsts: Vec<u64> = items.iter().map(|item| self.tabs[item[0]].id).collect();
         let tabs = div()
             .id("tabs")
             .text_size(dp(text_size::DETAIL))
@@ -2286,74 +3117,14 @@ impl FileBrowser {
             .py(dp(4.))
             .overflow_x_scroll()
             .track_scroll(&self.tab_scroll)
-            .children(self.tabs.iter().enumerate().map(|(index, tab)| {
-                let active = index == self.active_tab;
-                let title = if tab.query.is_empty() {
-                    tab.location
-                        .file_name()
-                        .unwrap_or(tab.location.as_os_str())
-                        .to_string_lossy()
-                        .into_owned()
-                } else {
-                    format!("Search: {}", tab.query)
-                };
-                let show_close = width >= 100. || active;
-                let target = tab.location.clone();
-                div()
-                    .id(("tab", index))
-                    .drag_over::<ExternalPaths>(|tab, _, _, _| tab.bg(rgb(0x1d4f7d)))
-                    .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
-                        this.drop_files(paths.paths().to_vec(), target.clone(), cx)
-                    }))
-                    .flex()
-                    .flex_1()
-                    .min_w(dp(36.))
-                    .px(dp(4.))
-                    .h_full()
-                    .items_center()
-                    .justify_center()
-                    .rounded(dp(radius::MD))
-                    .bg(rgb(if active { 0x353535 } else { 0x222222 }))
-                    .text_color(rgb(if active { 0xeeeeee } else { 0xaaaaaa }))
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.select_tab(index, window, cx);
-                    }))
-                    .when(width >= 70., |tab| {
-                        tab.child(
-                            div()
-                                .flex_1()
-                                .min_w(dp(0.))
-                                .text_center()
-                                .text_ellipsis()
-                                .child(title.clone()),
-                        )
-                    })
-                    .when(width < 70. && !show_close, |tab| {
-                        tab.child(div().size(dp(8.)).rounded_full().bg(rgb(0x0a84ff)))
-                    })
-                    .when(show_close, |tab| {
-                        tab.child(
-                            div()
-                                .id(("close-tab", index))
-                                .size(dp(24.))
-                                .flex_shrink_0()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded(dp(radius::SM))
-                                .hover(|button| button.bg(rgb(0x4a4a4a)))
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    cx.stop_propagation();
-                                    this.close_tab(index, window, cx);
-                                }))
-                                .child(native_icons::symbol("xmark", 10.)),
-                        )
-                    })
+            .children(items.iter().enumerate().map(|(position, item)| {
+                let next = firsts.get(position + 1).copied();
+                self.tab_item(item, next, width, dragging, items.len() > 1, cx)
             }));
         div()
             .ml(px((controls_width - sidebar_width).max(0.)))
+            // Tabs, the new-tab button, and search take presses here.
+            .occlude()
             .flex()
             .items_center()
             .h(titlebar.height)
@@ -2405,9 +3176,13 @@ impl FileBrowser {
                 .into_iter()
                 .map(MenuItem::Path)
                 .chain(
-                    matching_commands(query, self.updates_supported)
-                        .into_iter()
-                        .map(MenuItem::Command),
+                    matching_commands(
+                        query,
+                        self.updates_supported,
+                        self.group_of(self.tabs[self.active_tab].id).is_some(),
+                    )
+                    .into_iter()
+                    .map(MenuItem::Command),
                 )
                 .collect(),
         }
@@ -2704,6 +3479,9 @@ impl FileBrowser {
             .justify_center()
             .items_start()
             .pt(dp(64.))
+            // The same margin below, so a short window scrolls the list
+            // instead of cutting it off.
+            .pb(dp(24.))
             .on_mouse_down(MouseButton::Left, |_, window, cx| {
                 cx.stop_propagation();
                 window.dispatch_action(Box::new(ToggleCommandMenu), cx);
@@ -2713,12 +3491,17 @@ impl FileBrowser {
                 div()
                     .id("command-menu")
                     .w(width)
+                    .max_h_full()
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden()
                     .rounded(dp(radius::LG))
                     .bg(rgb(0x222222))
                     .shadow_lg()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(
                         div()
+                            .flex_shrink_0()
                             .h(dp(52.))
                             .px(dp(16.))
                             .flex()
@@ -2753,92 +3536,114 @@ impl FileBrowser {
                             .iter()
                             .position(|item| matches!(item, MenuItem::Command(_)))
                             .filter(|&position| position > 0);
-                        panel.child(div().p(dp(8.)).pt(dp(0.)).children(
-                            items.into_iter().enumerate().map(move |(position, item)| {
-                                div()
-                                    .id(("command", position))
-                                    .when(Some(position) == commands_start, |row| row.mt(dp(8.)))
-                                    .h(dp(40.))
-                                    .px(dp(8.))
-                                    .flex()
-                                    .items_center()
-                                    .gap(dp(10.))
-                                    .rounded(dp(radius::SM))
-                                    // Hover stays quieter than the keyboard selection.
-                                    .when(position == self.selected_command, |row| {
-                                        row.bg(rgb(0x303840))
-                                    })
-                                    .when(position != self.selected_command, |row| {
-                                        row.hover(|row| row.bg(rgb(0x2a2e33)))
-                                    })
-                                    .cursor_pointer()
-                                    .on_click({
-                                        let item = item.clone();
-                                        cx.listener(move |this, _, window, cx| {
-                                            cx.stop_propagation();
-                                            this.run_menu_item(item.clone(), window, cx);
-                                        })
-                                    })
-                                    .child(match &item {
-                                        MenuItem::Command(command) => {
-                                            native_icons::symbol(command.icon(), row::ICON)
-                                        }
-                                        MenuItem::Path(completion) => native_icons::file_icon(
-                                            completion.icon.clone(),
-                                            row::ICON,
-                                        ),
-                                    })
-                                    .child(div().flex_1().min_w(dp(0.)).text_ellipsis().child(
-                                        match &item {
-                                            MenuItem::Command(command) => {
-                                                command.label().to_owned()
-                                            }
-                                            MenuItem::Path(completion) => completion.label.clone(),
-                                        },
-                                    ))
-                                    .children(
-                                        match &item {
-                                            MenuItem::Command(command) => command.shortcut(),
-                                            MenuItem::Path(_) => None,
-                                        }
-                                        .map(|shortcut| {
-                                            div()
-                                                .text_size(dp(text_size::DETAIL))
-                                                .text_color(rgb(0xaaaaaa))
-                                                .child(shortcut)
-                                        }),
-                                    )
-                                    .children(match &item {
-                                        MenuItem::Command(Command::HiddenFiles) => {
-                                            Some(ui::checkbox(self.settings.show_hidden_files))
-                                        }
-                                        MenuItem::Command(Command::Sounds) => {
-                                            Some(ui::checkbox(!self.settings.mute_sounds))
-                                        }
-                                        MenuItem::Command(Command::ArrowsHistory) => {
-                                            Some(ui::checkbox(
-                                                self.settings.arrow_keys
-                                                    == storage::ArrowKeys::History,
-                                            ))
-                                        }
-                                        MenuItem::Command(Command::ArrowsFolderPath) => {
-                                            Some(ui::checkbox(
-                                                self.settings.arrow_keys
-                                                    == storage::ArrowKeys::FolderPath,
-                                            ))
-                                        }
-                                        MenuItem::Command(Command::ViewList) => Some(ui::checkbox(
-                                            self.settings.view == storage::View::List,
-                                        )),
-                                        MenuItem::Command(Command::ViewTiles) => {
-                                            Some(ui::checkbox(
-                                                self.settings.view == storage::View::Tiles,
-                                            ))
-                                        }
-                                        _ => None,
-                                    })
-                            }),
-                        ))
+                        panel.child(
+                            div()
+                                .id("command-list")
+                                .flex_1()
+                                .min_h(dp(0.))
+                                .overflow_y_scroll()
+                                .track_scroll(&self.command_scroll)
+                                .p(dp(8.))
+                                .pt(dp(0.))
+                                .children(items.into_iter().enumerate().map(
+                                    move |(position, item)| {
+                                        div()
+                                            .id(("command", position))
+                                            .when(Some(position) == commands_start, |row| {
+                                                row.mt(dp(8.))
+                                            })
+                                            .h(dp(40.))
+                                            .px(dp(8.))
+                                            .flex()
+                                            .items_center()
+                                            .gap(dp(10.))
+                                            .rounded(dp(radius::SM))
+                                            // Hover stays quieter than the keyboard selection.
+                                            .when(position == self.selected_command, |row| {
+                                                row.bg(rgb(0x303840))
+                                            })
+                                            .when(position != self.selected_command, |row| {
+                                                row.hover(|row| row.bg(rgb(0x2a2e33)))
+                                            })
+                                            .cursor_pointer()
+                                            .on_click({
+                                                let item = item.clone();
+                                                cx.listener(move |this, _, window, cx| {
+                                                    cx.stop_propagation();
+                                                    this.run_menu_item(item.clone(), window, cx);
+                                                })
+                                            })
+                                            .child(match &item {
+                                                MenuItem::Command(command) => {
+                                                    native_icons::symbol(command.icon(), row::ICON)
+                                                }
+                                                MenuItem::Path(completion) => {
+                                                    native_icons::file_icon(
+                                                        completion.icon.clone(),
+                                                        row::ICON,
+                                                    )
+                                                }
+                                            })
+                                            .child(
+                                                div().flex_1().min_w(dp(0.)).text_ellipsis().child(
+                                                    match &item {
+                                                        MenuItem::Command(command) => {
+                                                            command.label().to_owned()
+                                                        }
+                                                        MenuItem::Path(completion) => {
+                                                            completion.label.clone()
+                                                        }
+                                                    },
+                                                ),
+                                            )
+                                            .children(
+                                                match &item {
+                                                    MenuItem::Command(command) => {
+                                                        command.shortcut()
+                                                    }
+                                                    MenuItem::Path(_) => None,
+                                                }
+                                                .map(|shortcut| {
+                                                    div()
+                                                        .text_size(dp(text_size::DETAIL))
+                                                        .text_color(rgb(0xaaaaaa))
+                                                        .child(shortcut)
+                                                }),
+                                            )
+                                            .children(match &item {
+                                                MenuItem::Command(Command::HiddenFiles) => Some(
+                                                    ui::checkbox(self.settings.show_hidden_files),
+                                                ),
+                                                MenuItem::Command(Command::Sounds) => {
+                                                    Some(ui::checkbox(!self.settings.mute_sounds))
+                                                }
+                                                MenuItem::Command(Command::ArrowsHistory) => {
+                                                    Some(ui::checkbox(
+                                                        self.settings.arrow_keys
+                                                            == storage::ArrowKeys::History,
+                                                    ))
+                                                }
+                                                MenuItem::Command(Command::ArrowsFolderPath) => {
+                                                    Some(ui::checkbox(
+                                                        self.settings.arrow_keys
+                                                            == storage::ArrowKeys::FolderPath,
+                                                    ))
+                                                }
+                                                MenuItem::Command(Command::ViewList) => {
+                                                    Some(ui::checkbox(
+                                                        self.settings.view == storage::View::List,
+                                                    ))
+                                                }
+                                                MenuItem::Command(Command::ViewTiles) => {
+                                                    Some(ui::checkbox(
+                                                        self.settings.view == storage::View::Tiles,
+                                                    ))
+                                                }
+                                                _ => None,
+                                            })
+                                    },
+                                )),
+                        )
                     }),
             )
     }
@@ -2983,17 +3788,20 @@ impl Render for FileBrowser {
                 this.command_search
                     .update(cx, |input, cx| input.set_text(text, cx));
                 this.selected_command = 0;
+                this.command_scroll.scroll_to_item(0);
                 let query = this.command_search.read(cx).text().to_owned();
                 this.read_children_for(&query, cx);
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &PreviousCommand, _, cx| {
                 this.selected_command = this.selected_command.saturating_sub(1);
+                this.command_scroll.scroll_to_item(this.selected_command);
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &NextCommand, _, cx| {
                 let count = this.menu_items(cx).len();
                 this.selected_command = (this.selected_command + 1).min(count.saturating_sub(1));
+                this.command_scroll.scroll_to_item(this.selected_command);
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &CheckForUpdates, window, cx| {
@@ -3028,31 +3836,31 @@ impl Render for FileBrowser {
                 cx.notify();
             }))
             .on_action(
-                cx.listener(|this, _: &SelectTab1, window, cx| this.select_tab(0, window, cx)),
+                cx.listener(|this, _: &SelectTab1, window, cx| this.select_item(0, window, cx)),
             )
             .on_action(
-                cx.listener(|this, _: &SelectTab2, window, cx| this.select_tab(1, window, cx)),
+                cx.listener(|this, _: &SelectTab2, window, cx| this.select_item(1, window, cx)),
             )
             .on_action(
-                cx.listener(|this, _: &SelectTab3, window, cx| this.select_tab(2, window, cx)),
+                cx.listener(|this, _: &SelectTab3, window, cx| this.select_item(2, window, cx)),
             )
             .on_action(
-                cx.listener(|this, _: &SelectTab4, window, cx| this.select_tab(3, window, cx)),
+                cx.listener(|this, _: &SelectTab4, window, cx| this.select_item(3, window, cx)),
             )
             .on_action(
-                cx.listener(|this, _: &SelectTab5, window, cx| this.select_tab(4, window, cx)),
+                cx.listener(|this, _: &SelectTab5, window, cx| this.select_item(4, window, cx)),
             )
             .on_action(
-                cx.listener(|this, _: &SelectTab6, window, cx| this.select_tab(5, window, cx)),
+                cx.listener(|this, _: &SelectTab6, window, cx| this.select_item(5, window, cx)),
             )
             .on_action(
-                cx.listener(|this, _: &SelectTab7, window, cx| this.select_tab(6, window, cx)),
+                cx.listener(|this, _: &SelectTab7, window, cx| this.select_item(6, window, cx)),
             )
             .on_action(
-                cx.listener(|this, _: &SelectTab8, window, cx| this.select_tab(7, window, cx)),
+                cx.listener(|this, _: &SelectTab8, window, cx| this.select_item(7, window, cx)),
             )
             .on_action(cx.listener(|this, _: &SelectLastTab, window, cx| {
-                this.select_tab(this.tabs.len() - 1, window, cx)
+                this.select_item(usize::MAX, window, cx)
             }))
             .on_action(cx.listener(Self::toggle_hidden_files))
             .on_action(cx.listener(Self::toggle_sounds))
@@ -3070,6 +3878,13 @@ impl Render for FileBrowser {
             )
             .on_action(cx.listener(|this, _: &PathEditNext, _, cx| this.move_path_selection(1, cx)))
             .on_action(cx.listener(|this, _: &PathEditComplete, _, cx| this.complete_path_edit(cx)))
+            .on_action(cx.listener(|this, _: &SplitRight, window, cx| {
+                this.split_pane(panes::Side::Right, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SplitDown, window, cx| {
+                this.split_pane(panes::Side::Bottom, window, cx)
+            }))
+            .on_action(cx.listener(Self::move_pane_to_tab))
             .on_action(cx.listener(Self::go_left))
             .on_action(cx.listener(Self::go_right))
             .on_action(cx.listener(|this, _: &ArrowKeysHistory, _, cx| {
@@ -3154,6 +3969,27 @@ impl Render for FileBrowser {
             .text_color(rgb(0xeeeeee))
             .font_family(".SystemUIFont")
             .text_size(dp(text_size::BODY))
+            // Under everything: the titlebar's empty parts move the window and
+            // zoom it on double-click, as a native titlebar does. Controls in
+            // the titlebar block it.
+            .when(!window.is_fullscreen(), |view| {
+                view.child(
+                    div()
+                        .id("titlebar-drag")
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .h(titlebar.height)
+                        .on_mouse_down(MouseButton::Left, |event, window, _| {
+                            if event.click_count == 2 {
+                                window.titlebar_double_click();
+                            } else {
+                                window.start_window_move();
+                            }
+                        }),
+                )
+            })
             .child(self.sidebar.render(sidebar::SidebarView {
                 width: sidebar_width,
                 header_height: titlebar.sidebar_top,
@@ -3226,17 +4062,12 @@ impl Render for FileBrowser {
                     .min_w(dp(0.))
                     .min_h(dp(0.))
                     .child(self.tab_row(window, sidebar_width, &titlebar, cx))
-                    .child(self.path_bar(cx))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_h(dp(0.))
-                            .child(self.tabs[self.active_tab].list.clone()),
-                    ),
+                    .child(self.panes(window, cx)),
             )
             .child(
                 div()
                     .id("toggle-sidebar")
+                    .occlude()
                     .absolute()
                     .left(titlebar.toggle_left)
                     .top(titlebar.toggle_top)
@@ -3264,6 +4095,7 @@ impl Render for FileBrowser {
                     view.child(
                         div()
                             .id("update")
+                            .occlude()
                             .absolute()
                             .left(left)
                             .top(titlebar.update_top)
@@ -3333,6 +4165,36 @@ impl Render for FileBrowser {
                 view.child(self.context_menu_view(menu, window, cx))
             })
     }
+}
+
+/// A small icon button at a path bar's right end: shaded while `chosen`,
+/// dimmed and inert unless `enabled`.
+fn path_bar_button(
+    tip: &'static str,
+    symbol: &'static str,
+    chosen: bool,
+    enabled: bool,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(tip)
+        .flex_shrink_0()
+        .size(dp(24.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(dp(radius::SM))
+        .tooltip(ui::tooltip(tip))
+        .when(chosen, |button| button.bg(rgb(0x303030)))
+        .when(enabled && !chosen, |button| {
+            button
+                .cursor_pointer()
+                .hover(|button| button.bg(rgb(0x252525)))
+        })
+        .when(!enabled, |button| button.opacity(0.35))
+        .child(native_icons::symbol(
+            symbol,
+            if symbol == "xmark" { 10. } else { 14. },
+        ))
 }
 
 fn file_list_view(
@@ -3670,6 +4532,7 @@ fn main() {
         cx.bind_keys([
             KeyBinding::new("cmd-q", Quit, None),
             KeyBinding::new("cmd-t", NewTab, None),
+            KeyBinding::new("cmd-\\", SplitRight, None),
             KeyBinding::new("cmd-1", SelectTab1, None),
             KeyBinding::new("cmd-2", SelectTab2, None),
             KeyBinding::new("cmd-3", SelectTab3, None),
@@ -3749,6 +4612,10 @@ fn main() {
                     appears_transparent: true,
                     ..Default::default()
                 }),
+                // The tab bar lives in the titlebar. AppKit would otherwise
+                // move the window on any press there, so tabs could not be
+                // dragged; the app moves it from the titlebar's empty parts.
+                app_owns_titlebar_drag: true,
                 ..Default::default()
             },
             move |window, cx| {

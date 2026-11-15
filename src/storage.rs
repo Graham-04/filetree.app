@@ -76,6 +76,9 @@ pub(super) struct Session {
     pub sidebar: SidebarState,
     /// Files and folders the user opened, newest first.
     pub recent: Vec<PathBuf>,
+    /// Tabs of several panes: how each is arranged, its panes by their place
+    /// in `tabs`.
+    pub groups: Vec<crate::panes::Layout<usize>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]

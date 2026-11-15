@@ -13,7 +13,7 @@ cargo build --release
 ./target/release/filetree
 ```
 
-To build a `.app` bundle in `target/bundle`:
+To build a `.app` bundle in `target/bundle.noindex`:
 
 ```sh
 scripts/bundle.sh

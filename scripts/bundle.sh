@@ -1,5 +1,5 @@
 #!/bin/sh
-# Builds "Filetree.app" in target/bundle with an ad-hoc signature, for
+# Builds "Filetree.app" in target/bundle.noindex with an ad-hoc signature, for
 # running on this Mac, including the folder-access prompts that running from
 # Terminal hides (Terminal's own access is inherited). The identifier is
 # local.filetree unless BUNDLE_ID is set. A build made this way never
@@ -21,7 +21,9 @@ cd "$(dirname "$0")/.."
 bundle_id="${BUNDLE_ID:-$(plutil -extract CFBundleIdentifier raw -o - packaging/Info.plist)}"
 
 export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$HOME=~ --remap-path-prefix=$PWD=."
-export CARGO_TARGET_DIR=target/bundle
+# Spotlight skips folders named *.noindex, so dev builds never show up
+# beside the installed app when searching for Filetree.
+export CARGO_TARGET_DIR=target/bundle.noindex
 cargo build --release
 binary="$CARGO_TARGET_DIR/release/filetree"
 if strings "$binary" | grep -F -q "$HOME"; then

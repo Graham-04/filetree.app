@@ -598,6 +598,8 @@ fn rasterize(source: &Source, pixels: u32, points: f32) -> anyhow::Result<Arc<Re
                     | "list.bullet"
                     | "rectangle.grid.2x2"
                     | "lock"
+                    | "rectangle.split.2x1"
+                    | "rectangle.split.1x2"
                     | "eject" => Some(0.8_f64),
                     // Muted reads as off: a quiet gray rather than the blue
                     // of controls that are on.
