@@ -19,14 +19,22 @@ actions!(
     text_input,
     [
         Backspace,
+        DeletePreviousWord,
+        DeleteToStart,
         Delete,
         Left,
         Right,
         SelectLeft,
         SelectRight,
+        WordLeft,
+        WordRight,
+        SelectWordLeft,
+        SelectWordRight,
         SelectAll,
         Home,
         End,
+        SelectHome,
+        SelectEnd,
         ShowCharacterPalette,
         Paste,
         Cut,
@@ -124,6 +132,25 @@ impl SearchInput {
         self.select_to(self.next_boundary(self.cursor_offset()), cx);
     }
 
+    fn word_left(&mut self, _: &WordLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_to(
+            previous_word_start(&self.content, self.selected_range.start),
+            cx,
+        );
+    }
+
+    fn word_right(&mut self, _: &WordRight, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_to(next_word_end(&self.content, self.selected_range.end), cx);
+    }
+
+    fn select_word_left(&mut self, _: &SelectWordLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_to(previous_word_start(&self.content, self.cursor_offset()), cx);
+    }
+
+    fn select_word_right(&mut self, _: &SelectWordRight, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_to(next_word_end(&self.content, self.cursor_offset()), cx);
+    }
+
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
         self.move_to(0, cx);
         self.select_to(self.content.len(), cx)
@@ -137,11 +164,40 @@ impl SearchInput {
         self.move_to(self.content.len(), cx);
     }
 
+    fn select_home(&mut self, _: &SelectHome, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_to(0, cx);
+    }
+
+    fn select_end(&mut self, _: &SelectEnd, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_to(self.content.len(), cx);
+    }
+
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
+        self.delete_back_to(self.previous_boundary(self.cursor_offset()), window, cx);
+    }
+
+    fn delete_previous_word(
+        &mut self,
+        _: &DeletePreviousWord,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.delete_back_to(
+            previous_word_start(&self.content, self.cursor_offset()),
+            window,
+            cx,
+        );
+    }
+
+    fn delete_to_start(&mut self, _: &DeleteToStart, window: &mut Window, cx: &mut Context<Self>) {
+        self.delete_back_to(0, window, cx);
+    }
+
+    fn delete_back_to(&mut self, offset: usize, window: &mut Window, cx: &mut Context<Self>) {
         if self.selected_range.is_empty() {
-            self.select_to(self.previous_boundary(self.cursor_offset()), cx)
+            self.select_to(offset, cx);
         }
-        self.replace_text_in_range(None, "", window, cx)
+        self.replace_text_in_range(None, "", window, cx);
     }
 
     fn delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<Self>) {
@@ -544,7 +600,8 @@ impl Element for TextElement {
 
         let cursor_pos = line.x_for_index(cursor);
         let mut scroll_offset = input.scroll_offset;
-        let visible_width = (bounds.size.width - px(2.)).max(px(0.));
+        let caret_width = px(1.);
+        let visible_width = (bounds.size.width - caret_width).max(px(0.));
         if cursor_pos < scroll_offset {
             scroll_offset = cursor_pos;
         }
@@ -553,13 +610,18 @@ impl Element for TextElement {
         }
         scroll_offset = scroll_offset.min((line.width - visible_width).max(px(0.)));
         let (selection, cursor) = if selected_range.is_empty() {
+            // The shaped position is the insertion boundary. Center the caret
+            // there and snap it to a display pixel for a crisp edge.
+            let x =
+                (bounds.left() - scroll_offset + cursor_pos - caret_width / 2.).max(bounds.left());
+            let scale = window.scale_factor();
+            let x = (x * scale).round() / scale;
+            let height = font_size.min(bounds.size.height);
+            let y = bounds.top() + (bounds.size.height - height) / 2.;
             (
                 None,
                 Some(fill(
-                    Bounds::new(
-                        point((bounds.left() - scroll_offset) + cursor_pos, bounds.top()),
-                        size(px(2.), bounds.bottom() - bounds.top()),
-                    ),
+                    Bounds::new(point(x, y), size(caret_width, height)),
                     rgb(0x0a84ff),
                 )),
             )
@@ -609,6 +671,13 @@ impl Element for TextElement {
         if let Some(selection) = prepaint.selection.take() {
             window.paint_quad(selection)
         }
+        // A glyph's ink can extend across the insertion boundary. Keep it
+        // visible by painting the caret beneath the text.
+        if focus_handle.is_focused(window)
+            && let Some(cursor) = prepaint.cursor.take()
+        {
+            window.paint_quad(cursor);
+        }
         let line = prepaint.line.take().unwrap();
         line.paint(
             bounds.origin - point(prepaint.scroll_offset, px(0.)),
@@ -617,12 +686,6 @@ impl Element for TextElement {
             cx,
         )
         .unwrap();
-
-        if focus_handle.is_focused(window)
-            && let Some(cursor) = prepaint.cursor.take()
-        {
-            window.paint_quad(cursor);
-        }
 
         self.input.update(cx, |input, _cx| {
             input.scroll_offset = prepaint.scroll_offset;
@@ -640,14 +703,22 @@ impl Render for SearchInput {
             .track_focus(&self.focus_handle(cx))
             .cursor(CursorStyle::IBeam)
             .on_action(cx.listener(Self::backspace))
+            .on_action(cx.listener(Self::delete_previous_word))
+            .on_action(cx.listener(Self::delete_to_start))
             .on_action(cx.listener(Self::delete))
             .on_action(cx.listener(Self::left))
             .on_action(cx.listener(Self::right))
             .on_action(cx.listener(Self::select_left))
             .on_action(cx.listener(Self::select_right))
+            .on_action(cx.listener(Self::word_left))
+            .on_action(cx.listener(Self::word_right))
+            .on_action(cx.listener(Self::select_word_left))
+            .on_action(cx.listener(Self::select_word_right))
             .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(Self::home))
             .on_action(cx.listener(Self::end))
+            .on_action(cx.listener(Self::select_home))
+            .on_action(cx.listener(Self::select_end))
             .on_action(cx.listener(Self::show_character_palette))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::cut))
@@ -675,11 +746,26 @@ impl EventEmitter<Changed> for SearchInput {}
 pub(super) fn init(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("backspace", Backspace, Some("CommandSearch")),
+        KeyBinding::new("cmd-backspace", DeleteToStart, Some("CommandSearch")),
+        KeyBinding::new("ctrl-backspace", DeletePreviousWord, Some("CommandSearch")),
+        KeyBinding::new("alt-backspace", DeletePreviousWord, Some("CommandSearch")),
         KeyBinding::new("delete", Delete, Some("CommandSearch")),
         KeyBinding::new("left", Left, Some("CommandSearch")),
         KeyBinding::new("right", Right, Some("CommandSearch")),
         KeyBinding::new("shift-left", SelectLeft, Some("CommandSearch")),
         KeyBinding::new("shift-right", SelectRight, Some("CommandSearch")),
+        KeyBinding::new("alt-left", WordLeft, Some("CommandSearch")),
+        KeyBinding::new("alt-right", WordRight, Some("CommandSearch")),
+        KeyBinding::new("ctrl-left", WordLeft, Some("CommandSearch")),
+        KeyBinding::new("ctrl-right", WordRight, Some("CommandSearch")),
+        KeyBinding::new("alt-shift-left", SelectWordLeft, Some("CommandSearch")),
+        KeyBinding::new("alt-shift-right", SelectWordRight, Some("CommandSearch")),
+        KeyBinding::new("ctrl-shift-left", SelectWordLeft, Some("CommandSearch")),
+        KeyBinding::new("ctrl-shift-right", SelectWordRight, Some("CommandSearch")),
+        KeyBinding::new("cmd-left", Home, Some("CommandSearch")),
+        KeyBinding::new("cmd-right", End, Some("CommandSearch")),
+        KeyBinding::new("cmd-shift-left", SelectHome, Some("CommandSearch")),
+        KeyBinding::new("cmd-shift-right", SelectEnd, Some("CommandSearch")),
         KeyBinding::new("cmd-a", SelectAll, Some("CommandSearch")),
         KeyBinding::new("cmd-v", Paste, Some("CommandSearch")),
         KeyBinding::new("cmd-c", Copy, Some("CommandSearch")),
@@ -694,6 +780,20 @@ pub(super) fn init(cx: &mut App) {
     ]);
 }
 
+fn previous_word_start(text: &str, offset: usize) -> usize {
+    text.unicode_word_indices()
+        .rev()
+        .find(|&(start, _)| start < offset)
+        .map_or(0, |(start, _)| start)
+}
+
+fn next_word_end(text: &str, offset: usize) -> usize {
+    text.unicode_word_indices()
+        .map(|(start, word)| start + word.len())
+        .find(|&end| end > offset)
+        .unwrap_or(text.len())
+}
+
 fn byte_offset_for_utf16(text: &str, offset: usize) -> usize {
     let mut units = 0;
     let mut bytes = 0;
@@ -705,4 +805,26 @@ fn byte_offset_for_utf16(text: &str, offset: usize) -> usize {
         bytes += ch.len_utf8();
     }
     bytes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{next_word_end, previous_word_start};
+
+    #[test]
+    fn word_navigation_skips_separators_and_preserves_utf8_boundaries() {
+        let query = "  café 😺 κόσμος  ";
+        let cafe = query.find("café").expect("first word");
+        let kosmos = query.find("κόσμος").expect("second word");
+        let cafe_end = cafe + "café".len();
+        let kosmos_end = kosmos + "κόσμος".len();
+
+        assert_eq!(previous_word_start(query, query.len()), kosmos);
+        assert_eq!(previous_word_start(query, kosmos), cafe);
+        assert_eq!(previous_word_start(query, cafe), 0);
+        assert_eq!(next_word_end(query, 0), cafe_end);
+        assert_eq!(next_word_end(query, cafe_end), kosmos_end);
+        assert_eq!(next_word_end(query, kosmos + "κ".len()), kosmos_end);
+        assert_eq!(next_word_end(query, kosmos_end), query.len());
+    }
 }

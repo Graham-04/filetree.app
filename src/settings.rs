@@ -4,6 +4,7 @@ use gpui::{IntoElement, MouseButton, canvas, div, fill, prelude::*, px, rgb};
 
 use crate::{
     file_list::format_size,
+    file_viewer::DefaultStatus,
     search_index::IndexUsage,
     storage::UserSettings,
     ui::{self, dp, radius, text_size},
@@ -26,7 +27,11 @@ const FOLDER_COLORS: [u32; 5] = [0x3987e5, 0xd95926, 0x199e70, 0xc98500, 0xd5518
 const OTHER_COLOR: u32 = 0x4f4f4f;
 
 /// The dimmed overlay and panel. `usage` is `None` until an index is loaded.
-pub(super) fn render(usage: Option<&IndexUsage>, settings: &UserSettings) -> impl IntoElement {
+pub(super) fn render(
+    usage: Option<&IndexUsage>,
+    settings: &UserSettings,
+    default_file_manager: DefaultStatus,
+) -> impl IntoElement {
     div()
         .id("settings-overlay")
         .absolute()
@@ -88,7 +93,7 @@ pub(super) fn render(usage: Option<&IndexUsage>, settings: &UserSettings) -> imp
                                 .font_weight(gpui::FontWeight::MEDIUM)
                                 .child("Settings"),
                         )
-                        .child(section("General", files(settings)))
+                        .child(section("General", files(settings, default_file_manager)))
                         .child(section("Storage", index_storage(usage)))
                         .child(
                             div()
@@ -196,7 +201,7 @@ fn choice(
         .child(label)
 }
 
-fn files(settings: &UserSettings) -> impl IntoElement {
+fn files(settings: &UserSettings, default_file_manager: DefaultStatus) -> impl IntoElement {
     let arrows = settings.arrow_keys;
     div()
         .child(
@@ -262,6 +267,50 @@ fn files(settings: &UserSettings) -> impl IntoElement {
                 })
                 .child(ui::checkbox(settings.show_hidden_files)),
         )
+        .when(default_file_manager != DefaultStatus::Unavailable, |rows| {
+            rows.child(default_file_manager_row(default_file_manager))
+        })
+}
+
+fn default_file_manager_row(status: DefaultStatus) -> impl IntoElement {
+    row("Default file manager", false)
+        .when(status == DefaultStatus::Other, |row| {
+            row.child(
+                div()
+                    .id("make-default-file-manager")
+                    .px(dp(10.))
+                    .h(dp(26.))
+                    .flex()
+                    .items_center()
+                    .rounded(dp(radius::SM))
+                    .bg(rgb(0x3a3a3a))
+                    .hover(|button| button.bg(rgb(0x464646)))
+                    .active(|button| button.bg(rgb(0x505050)))
+                    .text_size(dp(text_size::DETAIL))
+                    .cursor_pointer()
+                    .on_click(|_, window, cx| {
+                        cx.stop_propagation();
+                        window.dispatch_action(Box::new(crate::MakeDefaultFileManager), cx);
+                    })
+                    .child("Make Default"),
+            )
+        })
+        .when(status == DefaultStatus::RestartRequired, |row| {
+            row.child(
+                div()
+                    .text_size(dp(text_size::DETAIL))
+                    .text_color(rgb(0xaaaaaa))
+                    .child("Restart Mac to Apply"),
+            )
+        })
+        .when(status == DefaultStatus::Filetree, |row| {
+            row.child(
+                div()
+                    .text_size(dp(text_size::DETAIL))
+                    .text_color(rgb(0xaaaaaa))
+                    .child("Filetree"),
+            )
+        })
 }
 
 fn index_storage(usage: Option<&IndexUsage>) -> impl IntoElement {

@@ -17,6 +17,7 @@ use gpui::{
 mod drag_out;
 mod file_list;
 mod file_ops;
+mod file_viewer;
 mod folder_cache;
 mod history;
 mod native_icons;
@@ -66,6 +67,7 @@ actions!(
         ResetZoom,
         ToggleCommandMenu,
         ToggleSettings,
+        MakeDefaultFileManager,
         ToggleHiddenFiles,
         ToggleSounds,
         CheckForUpdates,
@@ -142,6 +144,7 @@ struct BrowserTab {
     list: Entity<FileList>,
     history: history::History,
     live: LiveRefresh,
+    reveal: Vec<PathBuf>,
 }
 
 /// A tab of several panes. Its panes are tabs that left the tab bar to join
@@ -414,6 +417,7 @@ struct FileBrowser {
     /// An undo or redo is running; the next waits for it.
     reverting: bool,
     settings_open: bool,
+    default_file_manager: file_viewer::DefaultStatus,
     /// Measured when settings opens and refreshed while it stays open.
     index_usage: Option<search_index::IndexUsage>,
     command_search: Entity<search_input::SearchInput>,
@@ -553,6 +557,7 @@ impl FileBrowser {
                 list,
                 history: Default::default(),
                 live: LiveRefresh::default(),
+                reveal: Vec::new(),
             }],
             active_tab: 0,
             tab_scroll: ScrollHandle::new(),
@@ -574,6 +579,7 @@ impl FileBrowser {
             undo: Default::default(),
             reverting: false,
             settings_open: false,
+            default_file_manager: file_viewer::DefaultStatus::Unavailable,
             index_usage: None,
             search: ui::Reveal::new(false),
             file_search,
@@ -593,6 +599,7 @@ impl FileBrowser {
                 list,
                 history: Default::default(),
                 live: LiveRefresh::default(),
+                reveal: Vec::new(),
             });
             browser.next_tab_id += 1;
             browser.refresh_tab(browser.tabs.len() - 1, cx);
@@ -932,6 +939,28 @@ impl FileBrowser {
         }));
     }
 
+    fn make_default_file_manager(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use file_viewer::DefaultStatus;
+
+        if !self.settings_open || self.default_file_manager != DefaultStatus::Other {
+            return;
+        }
+        match file_viewer::make_default() {
+            Ok(status) => self.default_file_manager = status,
+            Err(error) => {
+                self.default_file_manager = file_viewer::default_status();
+                drop(window.prompt(
+                    PromptLevel::Warning,
+                    "Couldn’t make Filetree the default",
+                    Some(&error.to_string()),
+                    &["OK"],
+                    cx,
+                ));
+            }
+        }
+        cx.notify();
+    }
+
     /// Downloads and installs the offered update, showing progress in the
     /// button, then restarts into it. A failure leaves the app as it was and
     /// offers the update again.
@@ -1093,6 +1122,9 @@ impl FileBrowser {
         let query = tab.query.clone();
         let is_search = !query.trim().is_empty();
         let location = tab.location.clone();
+        if is_search || tab.reveal.first().and_then(|path| path.parent()) != Some(&location) {
+            tab.reveal.clear();
+        }
         let mut in_place = quiet;
         if !is_search && let Some(entries) = self.folders.get(&location) {
             let entries = self.visible(entries, false);
@@ -1175,30 +1207,38 @@ impl FileBrowser {
                 }
                 let tab = &mut this.tabs[index];
                 tab.loading = false;
+                let reveal = std::mem::take(&mut tab.reveal);
                 let empty_message = if is_search {
                     "No matching files"
                 } else {
                     "This folder is empty"
                 };
                 let stale = is_search && tab.search_revision != this.index_progress.revision;
-                tab.list.update(cx, |list, cx| match result {
-                    Ok(entries) if in_place => list.reconcile_entries(entries, empty_message, cx),
-                    Ok(entries) => {
-                        let empty = entries.is_empty();
-                        if is_search {
-                            list.set_search_entries(entries, cx);
-                        } else {
-                            list.set_entries(entries, cx);
+                tab.list.update(cx, |list, cx| {
+                    match result {
+                        Ok(entries) if in_place && reveal.is_empty() => {
+                            list.reconcile_entries(entries, empty_message, cx)
                         }
-                        if empty {
-                            list.set_message(Some(empty_message.into()), cx);
+                        Ok(entries) => {
+                            let empty = entries.is_empty();
+                            if is_search {
+                                list.set_search_entries(entries, cx);
+                            } else {
+                                list.set_entries(entries, cx);
+                            }
+                            if empty {
+                                list.set_message(Some(empty_message.into()), cx);
+                            }
+                        }
+                        Err(error) => {
+                            if !(quiet && is_search) {
+                                list.set_entries(Rc::from([]), cx);
+                            }
+                            list.set_error(&error, cx);
                         }
                     }
-                    Err(error) => {
-                        if !(quiet && is_search) {
-                            list.set_entries(Rc::from([]), cx);
-                        }
-                        list.set_error(&error, cx);
+                    if !reveal.is_empty() {
+                        list.reveal_paths(&reveal, cx);
                     }
                 });
                 if stale {
@@ -1996,7 +2036,7 @@ impl FileBrowser {
         }
     }
 
-    /// Keyboard focus belongs to the active file list so arrows and Enter work.
+    /// Keyboard focus belongs to the active file list so its shortcuts work.
     fn focus_list(&self, window: &mut Window, cx: &App) {
         self.tabs[self.active_tab].list.read(cx).focus(window);
     }
@@ -2078,6 +2118,7 @@ impl FileBrowser {
         let tab = &mut self.tabs[self.active_tab];
         tab.list.update(cx, |list, cx| list.end_drag(cx));
         tab.query.clear();
+        tab.reveal.clear();
         self.sync_search(cx);
         self.refresh_tab(self.active_tab, cx);
         self.focus_list(window, cx);
@@ -2088,6 +2129,53 @@ impl FileBrowser {
     fn open_paths(&mut self, paths: &[PathBuf], window: &mut Window, cx: &mut Context<Self>) {
         self.remember_recent(paths);
         self.open_without_remembering(paths, window, cx);
+    }
+
+    fn open_from_macos(
+        &mut self,
+        request: file_viewer::Request,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (paths, reveal) = match request {
+            file_viewer::Request::Open(paths) => (paths, false),
+            file_viewer::Request::Reveal(paths) => (paths, true),
+        };
+        let mut folders: Vec<(PathBuf, Vec<PathBuf>)> = Vec::new();
+        for path in paths {
+            let open_folder = !reveal && file_list::opens_as_folder(&path);
+            let folder = if open_folder {
+                path.as_path()
+            } else if let Some(parent) = path.parent() {
+                parent
+            } else {
+                continue;
+            };
+            if let Some((_, selection)) = folders.iter_mut().find(|(key, _)| key == folder) {
+                if !open_folder {
+                    selection.push(path);
+                }
+            } else {
+                folders.push((
+                    folder.to_path_buf(),
+                    (!open_folder).then_some(path).into_iter().collect(),
+                ));
+            }
+        }
+        if folders.is_empty() {
+            return;
+        }
+
+        for (index, (folder, selection)) in folders.into_iter().enumerate() {
+            if index == 0 {
+                self.navigate(folder, window, cx);
+            } else {
+                self.open_tab(folder, window, cx);
+            }
+            self.tabs[self.active_tab].reveal = selection;
+        }
+        window.activate_window();
+        cx.activate(true);
     }
 
     fn open_without_remembering(
@@ -2881,6 +2969,7 @@ impl FileBrowser {
             list,
             history: Default::default(),
             live: LiveRefresh::default(),
+            reveal: Vec::new(),
         });
         self.next_tab_id += 1;
         self.active_tab = self.tabs.len() - 1;
@@ -3743,6 +3832,7 @@ impl Render for FileBrowser {
                 this.settings_open = !this.settings_open;
                 if this.settings_open {
                     this.command_menu_open = false;
+                    this.default_file_manager = file_viewer::default_status();
                     this.tabs[this.active_tab]
                         .list
                         .update(cx, |list, cx| list.end_drag(cx));
@@ -3753,6 +3843,9 @@ impl Render for FileBrowser {
                     this.focus_list(window, cx);
                 }
                 cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &MakeDefaultFileManager, window, cx| {
+                this.make_default_file_manager(window, cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleCommandMenu, window, cx| {
                 this.settings_open = false;
@@ -4159,7 +4252,11 @@ impl Render for FileBrowser {
                 view.child(self.command_menu(window, cx))
             })
             .when(self.settings_open, |view| {
-                view.child(settings::render(self.index_usage.as_ref(), &self.settings))
+                view.child(settings::render(
+                    self.index_usage.as_ref(),
+                    &self.settings,
+                    self.default_file_manager,
+                ))
             })
             .when_some(self.context_menu.as_ref(), |view, menu| {
                 view.child(self.context_menu_view(menu, window, cx))
@@ -4525,7 +4622,9 @@ fn main() {
         eprintln!("A valid HOME directory is required");
         return;
     };
-    Application::new().run(move |cx: &mut App| {
+    let app = Application::new();
+    let (_reveal_handler, mut file_viewer_requests) = file_viewer::RevealHandler::listen(&app);
+    app.run(move |cx: &mut App| {
         search_input::init(cx);
         file_list::init(cx);
         cx.on_action(|_: &Quit, cx| cx.quit());
@@ -4604,30 +4703,44 @@ fn main() {
 
         let session: storage::Session = storage::load(&storage::session_path(&home));
         let bounds = initial_bounds(session.window, cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(bounds),
-                // Extend the content underneath the native title bar and traffic lights.
-                titlebar: Some(TitlebarOptions {
-                    appears_transparent: true,
+        let window = cx
+            .open_window(
+                WindowOptions {
+                    window_bounds: Some(bounds),
+                    // Extend the content underneath the native title bar and traffic lights.
+                    titlebar: Some(TitlebarOptions {
+                        appears_transparent: true,
+                        ..Default::default()
+                    }),
+                    // The tab bar lives in the titlebar. AppKit would otherwise
+                    // move the window on any press there, so tabs could not be
+                    // dragged; the app moves it from the titlebar's empty parts.
+                    app_owns_titlebar_drag: true,
                     ..Default::default()
-                }),
-                // The tab bar lives in the titlebar. AppKit would otherwise
-                // move the window on any press there, so tabs could not be
-                // dragged; the app moves it from the titlebar's empty parts.
-                app_owns_titlebar_drag: true,
-                ..Default::default()
-            },
-            move |window, cx| {
-                window.set_window_title("Filetree");
-                cx.new(|cx| {
-                    let browser = FileBrowser::new(home.clone(), session.clone(), window, cx);
-                    browser.focus_list(window, cx);
-                    browser
-                })
-            },
-        )
-        .expect("failed to open Filetree window");
+                },
+                move |window, cx| {
+                    window.set_window_title("Filetree");
+                    cx.new(|cx| {
+                        let browser = FileBrowser::new(home.clone(), session.clone(), window, cx);
+                        browser.focus_list(window, cx);
+                        browser
+                    })
+                },
+            )
+            .expect("failed to open Filetree window");
+        cx.spawn(async move |cx| {
+            while let Some(request) = file_viewer_requests.next().await {
+                if window
+                    .update(cx, |browser, window, cx| {
+                        browser.open_from_macos(request, window, cx);
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
         cx.activate(true);
     });
 }

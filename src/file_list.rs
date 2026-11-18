@@ -53,7 +53,7 @@ pub(super) fn init(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("cmd-a", SelectAll, Some("FileList")),
         KeyBinding::new("escape", ClearSelection, Some("FileList")),
-        KeyBinding::new("enter", OpenSelected, Some("FileList")),
+        KeyBinding::new("enter", RenameSelected, Some("FileList")),
         KeyBinding::new("cmd-down", OpenSelected, Some("FileList")),
         KeyBinding::new("up", SelectPrevious, Some("FileList")),
         KeyBinding::new("down", SelectNext, Some("FileList")),
@@ -526,6 +526,7 @@ pub(super) struct FileList {
     focus: FocusHandle,
     selected: Selection,
     anchor: Option<usize>,
+    reveal_scroll: bool,
     drag: Option<Drag>,
     /// Refreshed rows waiting for a gesture to end, and the empty-list message.
     pending_entries: Option<(Rc<[FileEntry]>, &'static str)>,
@@ -571,6 +572,7 @@ impl FileList {
             focus: cx.focus_handle(),
             selected: Selection::default(),
             anchor: None,
+            reveal_scroll: false,
             drag: None,
             pending_entries: None,
             renaming: None,
@@ -731,6 +733,7 @@ impl FileList {
         self.order = (0..self.entries.len()).collect();
         self.selected = Selection::default();
         self.anchor = None;
+        self.reveal_scroll = false;
         self.drag = None;
         self.pending_entries = None;
         if sort {
@@ -947,6 +950,21 @@ impl FileList {
         self.focus.focus(window);
     }
 
+    /// Selects items requested by the system and scrolls to the first one
+    /// once the list is laid out.
+    pub(super) fn reveal_paths(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) {
+        let paths: HashSet<_> = paths.iter().collect();
+        let selected: Vec<_> = self
+            .entries
+            .iter()
+            .map(|entry| paths.contains(&entry.path))
+            .collect();
+        self.selected = selection_in_order(&self.order, &selected);
+        self.anchor = self.selected.0.first().map(|range| range.start);
+        self.reveal_scroll = self.anchor.is_some();
+        cx.notify();
+    }
+
     /// Moves the selection by `step` rows (clamped to the list), or extends it
     /// from the anchor when `extend` is set, and scrolls the moved row into view.
     fn step_selection(
@@ -1078,9 +1096,7 @@ impl FileList {
         let editor = cx.new(|cx| SearchInput::new("", cx));
         editor.update(cx, |input, cx| input.edit(name, 0..stem, window, cx));
         let focus = editor.read(cx).focus_handle(cx);
-        let blur = cx.on_blur(&focus, window, |this, window, cx| {
-            this.commit_rename(window, cx)
-        });
+        let blur = cx.on_blur(&focus, window, |this, _, cx| this.commit_rename(cx));
         self.renaming = Some(Renaming {
             path: path.to_path_buf(),
             editor,
@@ -1100,7 +1116,7 @@ impl FileList {
         }
     }
 
-    fn commit_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn commit_rename(&mut self, cx: &mut Context<Self>) {
         let Some(renaming) = self.renaming.take() else {
             return;
         };
@@ -1115,7 +1131,6 @@ impl FileList {
                 name,
             });
         }
-        self.focus.focus(window);
         cx.notify();
     }
 
@@ -1491,6 +1506,13 @@ impl Render for FileList {
             .map(|drag| (drag.origin, drag.current));
         let scroll = self.scroll.clone();
         let columns = self.columns(window);
+        if self.reveal_scroll && (self.view == View::List || scroll.bounds().size.width > px(0.)) {
+            self.reveal_scroll = false;
+            if let Some(row) = self.anchor {
+                self.virtual_scroll
+                    .scroll_to_item(row / columns, gpui::ScrollStrategy::Top);
+            }
+        }
         let lines = self.entries.len().div_ceil(columns);
         if self.view == View::Tiles {
             // The grid is laid out from the width the last frame measured;
@@ -1530,9 +1552,10 @@ impl Render for FileList {
                 this.request_selected(Request::CopyPath, cx)
             }))
             .on_action(cx.listener(|_, _: &NewFolder, _, cx| cx.emit(Request::NewFolder)))
-            .on_action(
-                cx.listener(|this, _: &CommitRename, window, cx| this.commit_rename(window, cx)),
-            )
+            .on_action(cx.listener(|this, _: &CommitRename, window, cx| {
+                this.commit_rename(cx);
+                this.focus(window);
+            }))
             .on_action(
                 cx.listener(|this, _: &RenameSelected, window, cx| {
                     this.rename_selected(window, cx)
