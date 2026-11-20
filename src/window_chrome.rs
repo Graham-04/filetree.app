@@ -6,7 +6,7 @@ use gpui::{Pixels, Window, px};
 use objc::{msg_send, sel, sel_impl};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
-use crate::ui::dp;
+use crate::ui::{dp, row};
 
 pub(super) struct Titlebar {
     pub height: Pixels,
@@ -52,7 +52,13 @@ impl Titlebar {
         let update_fits = !fullscreen && update_left >= right_edge + gap * 2.;
         Self {
             height,
-            sidebar_top: if fullscreen { px(0.) } else { height },
+            // Fullscreen has no traffic-light strip, so the sidebar's first
+            // row is centred on the tab row beside it.
+            sidebar_top: if fullscreen {
+                (height - dp(row::HEIGHT).to_pixels(window.rem_size())) / 2.
+            } else {
+                height
+            },
             toggle_left,
             toggle_top: (height - toggle_size) / 2.,
             toggle_size,

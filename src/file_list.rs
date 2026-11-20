@@ -1167,14 +1167,58 @@ impl FileList {
     }
 
     /// Hides trashed items at once; the next listing confirms it.
+    /// Drops `paths` from the rows, keeping the order and the selection of the
+    /// rows that remain. When no selected row remains, the row that took the
+    /// place of the last removed one is selected, as in Finder.
     pub(super) fn remove_paths(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) {
-        let entries: Vec<FileEntry> = self
+        let removed: Vec<bool> = self
             .entries
             .iter()
-            .filter(|entry| !paths.contains(&entry.path))
-            .cloned()
+            .map(|entry| paths.contains(&entry.path))
             .collect();
-        self.replace_keeping_selection(entries, &[], cx);
+        let Some(last_removed) = self.order.iter().rposition(|entry| removed[*entry]) else {
+            return;
+        };
+        let mut new_index = vec![None; self.entries.len()];
+        let mut entries = Vec::with_capacity(self.entries.len());
+        for (index, entry) in self.entries.iter().enumerate() {
+            if !removed[index] {
+                new_index[index] = Some(entries.len());
+                entries.push(entry.clone());
+            }
+        }
+        let mut selected = vec![false; entries.len()];
+        for (row, entry) in self.order.iter().enumerate() {
+            if let Some(index) = new_index[*entry] {
+                selected[index] = self.selected.contains(row);
+            }
+        }
+        let anchor = self
+            .anchor
+            .and_then(|row| self.order.get(row))
+            .and_then(|entry| new_index[*entry]);
+        let order: Vec<usize> = self
+            .order
+            .iter()
+            .filter_map(|entry| new_index[*entry])
+            .collect();
+        if !selected.contains(&true) && !order.is_empty() {
+            let removed_rows = self.order[..=last_removed]
+                .iter()
+                .filter(|entry| removed[**entry])
+                .count();
+            let next = (last_removed + 1 - removed_rows).min(order.len() - 1);
+            selected[order[next]] = true;
+        }
+        self.entries = entries.into();
+        self.order = order;
+        self.selected = selection_in_order(&self.order, &selected);
+        self.anchor = anchor
+            .filter(|entry| selected[*entry])
+            .and_then(|entry| self.order.iter().position(|index| *index == entry))
+            .or_else(|| self.selected.0.first().map(|range| range.start));
+        self.drag = None;
+        cx.notify();
     }
 
     /// Replaces the rows in place, keeping scroll and sort, and selects `select`.
