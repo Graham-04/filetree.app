@@ -37,7 +37,7 @@ mod updater;
 mod watcher;
 mod window_chrome;
 
-use ui::{dp, radius, row, text_size};
+use ui::{chrome, dp, radius, row, text_size};
 
 /// Titlebar search widths in unzoomed points.
 /// Returns large blocks straight to the system. With macOS malloc, the
@@ -49,6 +49,9 @@ const SEARCH_CLOSED: f32 = 32.;
 const SEARCH_OPEN: f32 = 260.;
 /// The new-tab button, square, beside the tabs.
 const NEW_TAB: f32 = 32.;
+/// The tab row's right padding: the search magnifier ends on the Size
+/// column's right edge, above the path bar's last button.
+const TAB_ROW_END: f32 = 13.;
 
 actions!(
     filetree,
@@ -355,9 +358,10 @@ struct FileBrowser {
     index: search_index::SearchIndex,
     index_progress: search_index::Progress,
     _index_watch: gpui::Task<()>,
-    /// Mounted volumes for Locations, with icons, kept current by watching
-    /// /Volumes.
+    /// Mounted volumes for Locations, with their system icons.
     volumes: Vec<(system::Volume, native_icons::FileIcon)>,
+    _volume_observer: system::VolumeObserver,
+    _volume_watch: gpui::Task<()>,
     watcher: watcher::FolderWatcher,
     _folder_watch: gpui::Task<()>,
     /// Releases search buffers a minute after the last search; replaced, and
@@ -491,7 +495,19 @@ impl FileBrowser {
             eprintln!("Index startup: {error:#}");
         }
         let progress = index.progress();
-        // Live changes in shown folders, and in /Volumes for mounts.
+        // Subscribe before listing so a mount during startup also refreshes.
+        let (volume_observer, mut volumes_changed) = system::VolumeObserver::new();
+        let volume_watch = cx.spawn(async move |this, cx| {
+            while volumes_changed.next().await.is_some() {
+                if this
+                    .update(cx, |this, cx| this.refresh_volumes(cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        // Live changes in shown folders, with /Volumes as a sidebar fallback.
         let (watcher, mut folders_changed) = watcher::FolderWatcher::new();
         let folder_watch = cx.spawn(async move |this, cx| {
             while folders_changed.next().await.is_some() {
@@ -528,6 +544,8 @@ impl FileBrowser {
             index_progress: progress,
             _index_watch: watch,
             volumes: listed_volumes(),
+            _volume_observer: volume_observer,
+            _volume_watch: volume_watch,
             watcher,
             _folder_watch: folder_watch,
             search_trim: None,
@@ -1023,7 +1041,7 @@ impl FileBrowser {
         }));
     }
 
-    /// Watches exactly the folders tabs show, and /Volumes for mounts.
+    /// Watches the folders tabs show and /Volumes for sidebar changes.
     fn sync_watched(&mut self) {
         let folders: Vec<PathBuf> = self
             .tabs
@@ -1035,13 +1053,17 @@ impl FileBrowser {
         self.watcher.watch(folders);
     }
 
+    fn refresh_volumes(&mut self, cx: &mut Context<Self>) {
+        self.volumes = listed_volumes();
+        cx.notify();
+    }
+
     /// Another app changed shown folders: re-read the visible tab in place,
     /// and mark background tabs to re-read when shown.
     fn folders_changed(&mut self, cx: &mut Context<Self>) {
         let changes = self.watcher.take();
         if changes.everything || changes.folders.contains(Path::new("/Volumes")) {
-            self.volumes = listed_volumes();
-            cx.notify();
+            self.refresh_volumes(cx);
         }
         for index in 0..self.tabs.len() {
             let tab = &self.tabs[index];
@@ -2002,8 +2024,7 @@ impl FileBrowser {
                         ui::beep();
                     }
                 }
-                this.volumes = listed_volumes();
-                cx.notify();
+                this.refresh_volumes(cx);
             });
         })
         .detach();
@@ -2668,15 +2689,16 @@ impl FileBrowser {
             .flex()
             .items_center()
             .flex_shrink_0()
-            .h(dp(36.))
+            .h(dp(chrome::PATH_BAR))
             // Clicking the bar outside its segments types a path instead.
             .when(!editing, |bar| {
                 bar.cursor_text()
                     .on_click(cx.listener(|this, _, window, cx| this.begin_path_edit(window, cx)))
             })
-            // The back chevron's glyph starts on the file icons' column.
+            // The back chevron's glyph starts on the file icons' column, and
+            // the last button's ends on the Size column's right edge.
             .pl(dp(12.))
-            .pr(dp(8.))
+            .pr(dp(16.))
             .gap(dp(2.))
             .bg(rgb(0x181818))
             .border_b_1()
@@ -3185,7 +3207,7 @@ impl FileBrowser {
         let available = f32::from(window.viewport_size().width)
             - sidebar_width.max(controls_width)
             // The new-tab and search buttons, their gaps, and the right padding.
-            - (NEW_TAB + search_width + 14.) * scale;
+            - (NEW_TAB + search_width + 8. + TAB_ROW_END) * scale;
         let count = self.bar_items().len();
         let width = ((available / scale - 4. * (count - 1) as f32) / count as f32).max(36.);
         let items = self.bar_items();
@@ -3219,7 +3241,7 @@ impl FileBrowser {
             .h(titlebar.height)
             .flex_shrink_0()
             .gap(dp(4.))
-            .pr(dp(6.))
+            .pr(dp(TAB_ROW_END))
             .child(tabs)
             .child(
                 div()

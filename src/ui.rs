@@ -16,6 +16,16 @@ pub(super) mod row {
     pub const GAP: f32 = 8.;
 }
 
+/// The rows across the top of the window, which the sidebar's section
+/// headings line up with.
+pub(super) mod chrome {
+    pub const TAB_ROW: f32 = 40.;
+    /// Includes the path bar's 1dp bottom border.
+    pub const PATH_BAR: f32 = 36.;
+    /// The middle of the path bar's content, below its top.
+    pub const PATH_BAR_MIDDLE: f32 = (PATH_BAR - 1.) / 2.;
+}
+
 pub(super) mod radius {
     pub const XS: f32 = 4.;
     pub const SM: f32 = 6.;

@@ -6,7 +6,7 @@ use gpui::{Pixels, Window, px};
 use objc::{msg_send, sel, sel_impl};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
-use crate::ui::{dp, row};
+use crate::ui::{chrome, dp, row};
 
 pub(super) struct Titlebar {
     pub height: Pixels,
@@ -26,7 +26,7 @@ pub(super) struct Titlebar {
 impl Titlebar {
     pub(super) fn layout(window: &Window, sidebar_width: f32) -> Self {
         let fullscreen = window.is_fullscreen();
-        let height = dp(40.).to_pixels(window.rem_size());
+        let height = dp(chrome::TAB_ROW).to_pixels(window.rem_size());
         let height = if fullscreen {
             height
         } else {
@@ -42,7 +42,9 @@ impl Titlebar {
             align_traffic_lights(window, height)
         };
         let toggle_left = if fullscreen {
-            right_edge + gap
+            // Puts the toggle's glyph on the column the back chevron, the
+            // Name heading and the file icons start on, 20dp into the list.
+            right_edge + dp(14.).to_pixels(window.rem_size())
         } else {
             (px(sidebar_width) - toggle_size - gap).max(right_edge + gap)
         };
@@ -52,12 +54,13 @@ impl Titlebar {
         let update_fits = !fullscreen && update_left >= right_edge + gap * 2.;
         Self {
             height,
-            // Fullscreen has no traffic-light strip, so the sidebar's first
-            // row is centred on the tab row beside it.
+            // The sidebar's first heading is centred on the row beside it:
+            // the tab row in full screen, which has no traffic-light strip,
+            // and the path bar below the titlebar otherwise.
             sidebar_top: if fullscreen {
                 (height - dp(row::HEIGHT).to_pixels(window.rem_size())) / 2.
             } else {
-                height
+                height + dp(chrome::PATH_BAR_MIDDLE - row::HEIGHT / 2.).to_pixels(window.rem_size())
             },
             toggle_left,
             toggle_top: (height - toggle_size) / 2.,

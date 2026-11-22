@@ -2,13 +2,18 @@
 //! paste work with Finder both ways), Show in Finder, and the apps that can
 //! open a file.
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::{Mutex, PoisonError},
+};
 
 use anyhow::{Result, bail};
+use block::ConcreteBlock;
 use cocoa::{
     base::{BOOL, YES, id, nil},
     foundation::NSString,
 };
+use futures::channel::mpsc;
 use objc::{class, msg_send, rc::StrongPtr, sel, sel_impl};
 
 use crate::file_ops::{file_url, path_of};
@@ -158,6 +163,65 @@ unsafe extern "C" {
     static NSURLVolumeIsRemovableKey: id;
     static NSURLVolumeIsInternalKey: id;
     static NSURLVolumeIsLocalKey: id;
+}
+
+#[link(name = "AppKit", kind = "framework")]
+unsafe extern "C" {
+    static NSWorkspaceDidMountNotification: id;
+    static NSWorkspaceDidUnmountNotification: id;
+    static NSWorkspaceDidRenameVolumeNotification: id;
+}
+
+/// Keeps the workspace's volume observers registered until dropped.
+pub(super) struct VolumeObserver {
+    center: StrongPtr,
+    tokens: [StrongPtr; 3],
+}
+
+impl VolumeObserver {
+    pub(super) fn new() -> (Self, mpsc::Receiver<()>) {
+        let (wake, changes) = mpsc::channel(0);
+        let wake = Mutex::new(wake);
+        // SAFETY: Called on the main thread. The copied block may run on the
+        // posting thread, so it only signals through the protected sender.
+        unsafe {
+            let _pool = StrongPtr::new(msg_send![class!(NSAutoreleasePool), new]);
+            let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
+            let center: id = msg_send![workspace, notificationCenter];
+            let block = ConcreteBlock::new(move |_: id| {
+                // A pending wake already causes the full volume list to be read.
+                let _ = wake
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .try_send(());
+            })
+            .copy();
+            let tokens = [
+                NSWorkspaceDidMountNotification,
+                NSWorkspaceDidUnmountNotification,
+                NSWorkspaceDidRenameVolumeNotification,
+            ]
+            .map(|name| {
+                let token: id = msg_send![center,
+                    addObserverForName: name object: workspace queue: nil usingBlock: &*block
+                ];
+                StrongPtr::retain(token)
+            });
+            let center = StrongPtr::retain(center);
+            (Self { center, tokens }, changes)
+        }
+    }
+}
+
+impl Drop for VolumeObserver {
+    fn drop(&mut self) {
+        // SAFETY: The center and the registration tokens are still retained.
+        unsafe {
+            for token in &self.tokens {
+                let _: () = msg_send![*self.center, removeObserver: **token];
+            }
+        }
+    }
 }
 
 /// The volumes Finder lists, the startup disk first. Hidden system volumes

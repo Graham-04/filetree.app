@@ -12,7 +12,7 @@ use gpui::{
 use crate::{
     native_icons::FileIcon,
     storage::SidebarState,
-    ui::{Reveal, dp, radius, row, text_size},
+    ui::{Reveal, chrome, dp, radius, row, text_size},
 };
 
 pub(super) const WIDTH: f32 = 220.;
@@ -420,7 +420,9 @@ impl Sidebar {
                             .flex()
                             .items_center()
                             .gap(dp(4.))
-                            .px(dp(10.))
+                            .pl(dp(10.))
+                            // Centres the gear under the section chevrons.
+                            .pr(dp(6.))
                             .py(dp(6.))
                             .border_t_1()
                             .border_color(rgb(0x262626))
@@ -479,6 +481,11 @@ fn item(label: &'static str, symbol: &'static str) -> gpui::Div {
         .child(div().flex_1().min_w(dp(0.)).text_ellipsis().child(label))
 }
 
+/// Space above each section heading after the first. In full screen, the
+/// first heading is centred on the tab row, and this puts the second on the
+/// path bar below it while the first section is collapsed.
+const SECTION_GAP: f32 = chrome::TAB_ROW / 2. + chrome::PATH_BAR_MIDDLE - row::HEIGHT;
+
 fn section_heading(
     id: &'static str,
     label: &'static str,
@@ -490,9 +497,13 @@ fn section_heading(
         .flex()
         .items_center()
         .justify_between()
-        .mt(dp(16.))
+        .mt(dp(SECTION_GAP))
         .h(dp(row::HEIGHT))
-        .px(dp(10.))
+        .pl(dp(10.))
+        // Centres the chevron under the sidebar toggle, 20dp from the
+        // sidebar's right edge (the list's own 10dp inset plus this 4dp and
+        // half the 12dp chevron).
+        .pr(dp(4.))
         .rounded(dp(radius::SM))
         .text_size(dp(text_size::DETAIL))
         .font_weight(gpui::FontWeight::SEMIBOLD)
@@ -566,7 +577,7 @@ fn eject_button(index: usize, eject: impl Fn(&mut App) + 'static) -> impl IntoEl
         .size(dp(20.))
         // Extend into the row's padding so the glyph lines up with the
         // section chevrons above.
-        .mr(dp(-4.))
+        .mr(dp(-10.))
         .flex()
         .items_center()
         .justify_center()
