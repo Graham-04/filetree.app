@@ -1,4 +1,6 @@
 use crate::{
+    file_tags::{self, Tag},
+    motion::{self, Presence},
     native_icons,
     search_input::SearchInput,
     storage::View,
@@ -15,7 +17,7 @@ use gpui::{
 };
 use std::{
     cmp::Ordering,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     ops::Range,
     path::{Path, PathBuf},
@@ -133,6 +135,10 @@ struct Renaming {
 /// Folders browse in place; files and packages such as `.app` bundles open
 /// in their default application.
 pub(super) fn opens_as_folder(path: &std::path::Path) -> bool {
+    path.is_dir() && !is_package(path)
+}
+
+pub(super) fn is_package(path: &std::path::Path) -> bool {
     use cocoa::base::{NO, id, nil};
     use objc::{class, msg_send, sel, sel_impl};
     use std::os::unix::ffi::OsStrExt;
@@ -150,11 +156,11 @@ pub(super) fn opens_as_folder(path: &std::path::Path) -> bool {
             length: bytes.len()
         ];
         if native_path == nil {
-            return true;
+            return false;
         }
         let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
         let package: cocoa::base::BOOL = msg_send![workspace, isFilePackageAtPath: native_path];
-        package == NO
+        package != NO
     }
 }
 
@@ -166,6 +172,7 @@ pub(super) struct FileEntry {
     modified: Option<SystemTime>,
     bytes: Option<u64>,
     icon: native_icons::FileIcon,
+    tags: Vec<Tag>,
     /// A folder that accepts drops: not a package such as `.app`.
     drop_target: bool,
 }
@@ -270,9 +277,8 @@ pub(super) fn read_directory(directory: &std::path::Path) -> anyhow::Result<Vec<
     Ok(entries)
 }
 
-/// Reads each path's metadata once, across cores: a folder of tens of
-/// thousands of files is bound by one metadata call per entry. Display labels
-/// are formatted per visible row at render time instead of stored per entry.
+/// Reads metadata and Finder tags across cores. Display labels are formatted
+/// per visible row at render time instead of stored per entry.
 pub(super) fn entries_for_paths(paths: Vec<PathBuf>) -> Vec<FileEntry> {
     use rayon::prelude::*;
     paths
@@ -295,6 +301,7 @@ pub(super) fn entries_for_paths(paths: Vec<PathBuf>) -> Vec<FileEntry> {
                 drop_target: target.as_ref().is_some_and(|meta| meta.is_dir())
                     && path.extension().is_none(),
                 icon: native_icons::FileIcon::classify(&path, link.as_ref()),
+                tags: file_tags::read(&path).unwrap_or_default(),
                 sort_name: name.to_lowercase(),
                 name,
                 modified: target.as_ref().and_then(|meta| meta.modified().ok()),
@@ -535,6 +542,7 @@ pub(super) struct FileList {
     press: Option<Press>,
     /// Paths in a native drag that has not ended yet.
     dragging_out: Option<Vec<PathBuf>>,
+    tile_motion: TileMotion,
 }
 
 /// A mouse press on a row, until it is released or becomes a drag.
@@ -542,10 +550,36 @@ struct Press {
     origin: Point<Pixels>,
     /// A plain press on an already selected row keeps the whole selection,
     /// so it can be dragged, and selects only that row on release.
-    collapse_to: Option<usize>,
+    collapse_to: Option<DisplayedItem>,
+}
+
+/// Retain the identity drawn in a hitbox across scrolling and folder refreshes.
+#[derive(Clone)]
+struct DisplayedItem {
+    row: usize,
+    path: PathBuf,
+}
+
+impl DisplayedItem {
+    fn resolve(&self, entries: &[FileEntry], order: &[usize]) -> Option<usize> {
+        if order
+            .get(self.row)
+            .is_some_and(|&i| entries[i].path == self.path)
+        {
+            Some(self.row)
+        } else {
+            order.iter().position(|&i| entries[i].path == self.path)
+        }
+    }
 }
 
 impl FileList {
+    pub(super) fn contains_paths(&self, paths: &HashSet<&Path>) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| paths.contains(entry.path.as_path()))
+    }
+
     pub(super) fn new(entries: Rc<[FileEntry]>, view: View, cx: &mut Context<Self>) -> Self {
         let virtual_scroll = UniformListScrollHandle::new();
         let scroll = virtual_scroll.0.borrow().base_handle.clone();
@@ -578,6 +612,7 @@ impl FileList {
             renaming: None,
             press: None,
             dragging_out: None,
+            tile_motion: TileMotion::default(),
         }
     }
 
@@ -586,6 +621,7 @@ impl FileList {
         if self.view == view {
             return;
         }
+        self.remember_tiles();
         self.view = view;
         self.drag = None;
         self.scroll.set_offset(point(px(0.), px(0.)));
@@ -615,11 +651,13 @@ impl FileList {
 
     /// The height of one line of rows or tiles.
     fn line_height(&self, window: &Window) -> Pixels {
-        dp(match self.view {
+        let height = dp(match self.view {
             View::List => row::HEIGHT,
             View::Tiles => TILE_HEIGHT,
         })
-        .to_pixels(window.rem_size())
+        .to_pixels(window.rem_size());
+        // UniformList lays out each line as a root and repeats its rounded height.
+        (height * window.scale_factor()).round() / window.scale_factor()
     }
 
     /// Shown centered in place of rows when the list is empty.
@@ -706,6 +744,9 @@ impl FileList {
             .anchor
             .and_then(|row| self.order.get(row))
             .map(|entry| self.entries[*entry].path.clone());
+        if self.view == View::Tiles {
+            self.remember_tiles();
+        }
         self.entries = entries;
         self.order = (0..self.entries.len()).collect();
         if self.explicit_sort || !self.ranked {
@@ -726,6 +767,9 @@ impl FileList {
     }
 
     fn replace_entries(&mut self, entries: Rc<[FileEntry]>, sort: bool, cx: &mut Context<Self>) {
+        if self.view == View::Tiles && !Rc::ptr_eq(&self.entries, &entries) {
+            self.remember_tiles();
+        }
         self.message = None;
         self.stop_loading();
         self.scroll.set_offset(point(px(0.), px(0.)));
@@ -736,6 +780,7 @@ impl FileList {
         self.reveal_scroll = false;
         self.drag = None;
         self.pending_entries = None;
+        self.press = None;
         if sort {
             self.reorder();
         }
@@ -889,9 +934,10 @@ impl FileList {
     /// multiple selection selects just that row.
     fn release_press(&mut self, cx: &mut Context<Self>) {
         if let Some(Press {
-            collapse_to: Some(row),
+            collapse_to: Some(item),
             ..
         }) = self.press.take()
+            && let Some(row) = item.resolve(&self.entries, &self.order)
         {
             self.selected.replace(row..row + 1);
             self.anchor = Some(row);
@@ -1017,40 +1063,45 @@ impl FileList {
         self.request_selected(Request::Open, cx);
     }
 
-    /// The row or tile under `position` (window coordinates), if any.
-    fn item_at(&self, position: Point<Pixels>, window: &Window) -> Option<usize> {
-        let position = self.content_point(position);
-        let line = (f32::from(position.y) / f32::from(self.line_height(window))).floor();
-        let inset = dp(INSET).to_pixels(window.rem_size());
-        if line < 0. || position.x < inset || position.x > self.scroll.bounds().size.width - inset {
-            return None;
-        }
-        let column = match self.view {
-            View::List => 0,
-            View::Tiles => {
-                let tile = self.tile_width(self.columns(window), window);
-                let column = (f32::from(position.x - inset) / f32::from(tile)).floor() as usize;
-                if column >= self.columns(window) {
-                    return None;
-                }
-                column
-            }
+    fn item_mouse_down(
+        &self,
+        row: usize,
+        list: Entity<Self>,
+    ) -> impl Fn(&MouseDownEvent, &mut Window, &mut App) + use<> {
+        let target = DisplayedItem {
+            row,
+            path: self.entries[self.order[row]].path.clone(),
         };
-        let index = line as usize * self.columns(window) + column;
-        (index < self.entries.len()).then_some(index)
+        move |event, window, cx| {
+            if !matches!(event.button, MouseButton::Left | MouseButton::Right) {
+                return;
+            }
+            cx.stop_propagation();
+            list.update(cx, |this, cx| {
+                let Some(row) = target.resolve(&this.entries, &this.order) else {
+                    return;
+                };
+                if event.button == MouseButton::Right {
+                    this.right_mouse_down(Some(row), event, window, cx);
+                } else {
+                    this.press_item(row, &target, event, window, cx);
+                }
+            });
+        }
     }
 
     /// Right-click selects the row under the pointer unless it is already
     /// part of the selection, as in Finder; on blank space it clears it.
     fn right_mouse_down(
         &mut self,
+        row: Option<usize>,
         event: &MouseDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.focus.focus(window);
         self.drag = None;
-        match self.item_at(event.position, window) {
+        match row {
             Some(row) if !self.selected.contains(row) => {
                 self.selected.replace(row..row + 1);
                 self.anchor = Some(row);
@@ -1162,6 +1213,9 @@ impl FileList {
     ) {
         let mut entries: Vec<FileEntry> = self.entries.to_vec();
         entries.extend(entries_for_paths(vec![path.clone()]));
+        if self.view == View::Tiles {
+            self.remember_tiles();
+        }
         self.replace_keeping_selection(entries, std::slice::from_ref(&path), cx);
         self.begin_rename(&path, window, cx);
     }
@@ -1179,6 +1233,9 @@ impl FileList {
         let Some(last_removed) = self.order.iter().rposition(|entry| removed[*entry]) else {
             return;
         };
+        if self.view == View::Tiles {
+            self.remember_tiles();
+        }
         let mut new_index = vec![None; self.entries.len()];
         let mut entries = Vec::with_capacity(self.entries.len());
         for (index, entry) in self.entries.iter().enumerate() {
@@ -1242,70 +1299,61 @@ impl FileList {
         cx.notify();
     }
 
-    fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+    fn press_item(
+        &mut self,
+        index: usize,
+        target: &DisplayedItem,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.focus.focus(window);
-        let position = self.content_point(event.position);
-        let height = self.line_height(window);
-        let hit = self.item_at(event.position, window);
-        if let Some(index) = hit
-            && event.click_count == 2
-            && !event.modifiers.shift
-            && !event.modifiers.platform
-        {
+        if event.click_count == 2 && !event.modifiers.shift && !event.modifiers.platform {
             self.drag = None;
             cx.emit(Request::Open(vec![
                 self.entries[self.order[index]].path.clone(),
             ]));
             return;
         }
-        if let Some(index) = hit {
-            let mut collapse_to = None;
-            if event.modifiers.shift {
-                let anchor = self.anchor.unwrap_or(index);
-                if !event.modifiers.platform {
-                    self.selected.0.clear();
-                }
-                self.selected.add(anchor.min(index)..anchor.max(index) + 1);
-            } else if event.modifiers.platform {
-                self.selected.toggle(index..index + 1);
-                self.anchor = Some(index);
-            } else if self.selected.contains(index) {
-                collapse_to = Some(index);
-                self.anchor = Some(index);
-            } else {
-                self.selected.replace(index..index + 1);
-                self.anchor = Some(index);
+        let mut collapse_to = None;
+        if event.modifiers.shift {
+            let anchor = self.anchor.unwrap_or(index);
+            if !event.modifiers.platform {
+                self.selected.0.clear();
             }
-            // Dragging from a row drags files; the marquee starts on blank space.
-            self.drag = None;
-            self.press = Some(Press {
-                origin: event.position,
-                collapse_to,
-            });
-            cx.notify();
-            return;
+            self.selected.add(anchor.min(index)..anchor.max(index) + 1);
+        } else if event.modifiers.platform {
+            self.selected.toggle(index..index + 1);
+            self.anchor = Some(index);
+        } else if self.selected.contains(index) {
+            collapse_to = Some(target.clone());
+            self.anchor = Some(index);
+        } else {
+            self.selected.replace(index..index + 1);
+            self.anchor = Some(index);
         }
-        let mut baseline = self.selected.clone();
-        if let Some(index) = hit {
-            if event.modifiers.shift {
-                let anchor = self.anchor.unwrap_or(index);
-                if !event.modifiers.platform {
-                    self.selected.0.clear();
-                }
-                self.selected.add(anchor.min(index)..anchor.max(index) + 1);
-            } else if event.modifiers.platform {
-                self.selected.toggle(index..index + 1);
-                self.anchor = Some(index);
-            } else {
-                self.selected.replace(index..index + 1);
-                self.anchor = Some(index);
-            }
-        } else if !event.modifiers.platform && !event.modifiers.shift {
+        // Dragging from a row drags files; the marquee starts on blank space.
+        self.drag = None;
+        self.press = Some(Press {
+            origin: event.position,
+            collapse_to,
+        });
+        cx.notify();
+    }
+
+    fn press_background(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.focus.focus(window);
+        let position = self.content_point(event.position);
+        let height = self.line_height(window);
+        let baseline = self.selected.clone();
+        if !event.modifiers.platform && !event.modifiers.shift {
             self.selected.0.clear();
             self.anchor = None;
-        }
-        if event.modifiers.shift {
-            baseline = self.selected.clone();
         }
         self.drag = Some(Drag {
             origin: position,
@@ -1373,7 +1421,7 @@ impl FileList {
                 let rows = intersecting_rows(
                     drag.origin,
                     position,
-                    dp(row::HEIGHT).to_pixels(window.rem_size()),
+                    drag.row_height,
                     count,
                     inset,
                     width - inset,
@@ -1387,7 +1435,7 @@ impl FileList {
             View::Tiles => intersecting_tiles(
                 drag.origin - point(inset, px(0.)),
                 position - point(inset, px(0.)),
-                size(tile_width, dp(TILE_HEIGHT).to_pixels(window.rem_size())),
+                size(tile_width, drag.row_height),
                 columns,
                 count,
             ),
@@ -1558,6 +1606,7 @@ impl Render for FileList {
             }
         }
         let lines = self.entries.len().div_ceil(columns);
+        self.animate_tiles(columns, window);
         if self.view == View::Tiles {
             // The grid is laid out from the width the last frame measured;
             // if this frame measures another, lay it out again.
@@ -1608,7 +1657,12 @@ impl Render for FileList {
             .on_action(
                 cx.listener(|this, _: &CancelRename, window, cx| this.cancel_rename(window, cx)),
             )
-            .on_mouse_down(MouseButton::Right, cx.listener(Self::right_mouse_down))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, event, window, cx| {
+                    this.right_mouse_down(None, event, window, cx);
+                }),
+            )
             // Drops on the list itself go into the folder it shows.
             .on_drop(cx.listener(|_, paths: &ExternalPaths, _, cx| {
                 cx.emit(Request::Drop {
@@ -1659,7 +1713,7 @@ impl Render for FileList {
                 this.drag = None;
                 cx.notify();
             }))
-            .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::press_background))
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
@@ -1719,6 +1773,9 @@ impl Render for FileList {
                                         let carried = selected && this.dragging_out.is_some();
                                         div()
                                             .id(("file", index))
+                                            .on_any_mouse_down(
+                                                this.item_mouse_down(index, list.clone()),
+                                            )
                                             .when(entry.drop_target && !carried, |row| {
                                                 let folder = entry.path.clone();
                                                 let list = list.clone();
@@ -1767,11 +1824,7 @@ impl Render for FileList {
                                                                 .flex_1()
                                                                 .min_w(dp(0.))
                                                         }
-                                                        _ => div()
-                                                            .flex_1()
-                                                            .min_w(dp(0.))
-                                                            .text_ellipsis()
-                                                            .child(entry.name.clone()),
+                                                        _ => list_name(entry, index),
                                                     }),
                                             )
                                             .child(
@@ -1847,6 +1900,12 @@ impl Render for FileList {
                     .inset_0(),
                 )
             })
+            .children(
+                self.tile_motion
+                    .departing
+                    .iter()
+                    .map(|tile| tile.render(window)),
+            )
             .when(self.entries.is_empty(), |view| {
                 view.when_some(self.message.clone(), |view, message| {
                     view.child(
@@ -1893,6 +1952,54 @@ impl Render for FileList {
                 )
             })
     }
+}
+
+fn list_name(entry: &FileEntry, index: usize) -> gpui::Div {
+    let label = div().min_w_0().truncate().child(entry.name.clone());
+    div()
+        .flex_1()
+        .min_w_0()
+        .flex()
+        .items_center()
+        .gap(dp(6.))
+        .child(label)
+        .when(!entry.tags.is_empty(), |name| {
+            name.child(tag_indicators(&entry.tags, index))
+        })
+}
+
+fn tag_indicators(tags: &[Tag], index: usize) -> gpui::Stateful<gpui::Div> {
+    const LIMIT: usize = 3;
+    let names = tags
+        .iter()
+        .map(|tag| tag.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    div()
+        .id(("file-tags", index))
+        .flex()
+        .flex_shrink_0()
+        .items_center()
+        .gap(dp(3.))
+        .tooltip(ui::tooltip(names))
+        .children(tags.iter().take(LIMIT).map(|tag| {
+            div()
+                .size(dp(9.))
+                .flex_shrink_0()
+                .rounded(dp(3.))
+                .map(|swatch| match tag.color {
+                    Some(color) => swatch.bg(rgb(color)),
+                    None => swatch.border_1().border_color(rgb(0xa8a8ad)),
+                })
+        }))
+        .when(tags.len() > LIMIT, |group| {
+            group.child(
+                div()
+                    .text_size(dp(text_size::DETAIL))
+                    .text_color(rgb(0xbbbbbb))
+                    .child(format!("+{}", tags.len() - LIMIT)),
+            )
+        })
 }
 
 /// A protected folder: what is wrong, where to fix it, and a button there.
@@ -1965,11 +2072,249 @@ fn rename_field(renaming: &Renaming) -> gpui::Div {
 }
 
 /// The grid's measurements for one frame.
+#[derive(Clone, Copy)]
 struct Tiles {
     columns: usize,
     width: Pixels,
     /// The room a name's text has.
     name_width: Pixels,
+}
+
+#[derive(Default)]
+struct TileMotion {
+    presented: bool,
+    viewport: Option<TileViewport>,
+    previous: Option<TileSnapshot>,
+    entering: HashMap<PathBuf, Presence>,
+    departing: Vec<DepartingTile>,
+    last_frame: Option<Instant>,
+    offset: Point<Pixels>,
+}
+
+struct TileViewport {
+    tiles: Tiles,
+    inset: Pixels,
+    height: Pixels,
+    line: Pixels,
+}
+
+impl TileViewport {
+    fn visible(&self, offset: Point<Pixels>, count: usize) -> Range<usize> {
+        if self.height <= px(0.) {
+            return 0..0;
+        }
+        let line = f32::from(self.line);
+        let first = (-f32::from(offset.y) / line).floor().max(0.) as usize;
+        let last = (f32::from(self.height - offset.y) / line).ceil().max(0.) as usize;
+        (first * self.tiles.columns).min(count)..(last * self.tiles.columns).min(count)
+    }
+
+    fn position(&self, index: usize, offset: Point<Pixels>) -> Point<Pixels> {
+        point(
+            self.inset + self.tiles.width * (index % self.tiles.columns) as f32,
+            self.line * (index / self.tiles.columns) as f32,
+        ) + offset
+    }
+}
+
+struct TileSnapshot {
+    entries: Option<Rc<[FileEntry]>>,
+    visible: Vec<DepartingTile>,
+    changed: Instant,
+}
+
+struct DepartingTile {
+    entry: FileEntry,
+    position: Point<Pixels>,
+    tiles: Tiles,
+    selected: bool,
+    presence: Presence,
+}
+
+impl DepartingTile {
+    fn render(&self, window: &Window) -> gpui::Div {
+        let amount = self.presence.value();
+        let mut names = window.text_system().line_wrapper(
+            window.text_style().font(),
+            dp(text_size::DETAIL).to_pixels(window.rem_size()),
+        );
+        div()
+            .absolute()
+            .left(self.position.x)
+            .top(self.position.y + dp(tile_travel(amount)).to_pixels(window.rem_size()))
+            .w(self.tiles.width)
+            .h(dp(TILE_HEIGHT))
+            .flex()
+            .flex_col()
+            .items_center()
+            .pt(dp(6.))
+            .gap(dp(4.))
+            .opacity(amount)
+            .child(
+                tile_icon()
+                    .when(self.selected, |icon| icon.bg(rgb(0x303030)))
+                    .child(native_icons::file_icon(self.entry.icon.clone(), TILE_ICON)),
+            )
+            .child(tile_name(
+                &self.entry,
+                self.tiles.name_width,
+                &mut names,
+                self.selected,
+                false,
+            ))
+    }
+}
+
+impl FileList {
+    pub(super) fn hide_tile_motion(&mut self) {
+        self.tile_motion = TileMotion::default();
+    }
+
+    fn remember_tiles(&mut self) {
+        if !self.tile_motion.presented || self.tile_motion.previous.is_some() {
+            return;
+        }
+        let mut snapshot = TileSnapshot {
+            entries: None,
+            visible: Vec::new(),
+            changed: Instant::now(),
+        };
+        if self.view == View::Tiles
+            && let Some(viewport) = &self.tile_motion.viewport
+        {
+            let offset = self.scroll.offset();
+            snapshot.entries = Some(self.entries.clone());
+            snapshot.visible = viewport
+                .visible(offset, self.entries.len())
+                .map(|index| DepartingTile {
+                    entry: self.entries[self.order[index]].clone(),
+                    position: viewport.position(index, offset),
+                    tiles: viewport.tiles,
+                    selected: self.is_selected(index),
+                    presence: Presence::new(true),
+                })
+                .collect();
+        }
+        self.tile_motion.previous = Some(snapshot);
+    }
+
+    fn animate_tiles(&mut self, columns: usize, window: &Window) {
+        let now = Instant::now();
+        self.tile_motion.presented = true;
+        let offset = self.scroll.offset();
+        self.tile_motion.viewport = (self.view == View::Tiles).then(|| {
+            let width = self.tile_width(columns, window);
+            TileViewport {
+                tiles: Tiles {
+                    columns,
+                    width,
+                    name_width: width - dp(TILE_NAME_MARGIN).to_pixels(window.rem_size()),
+                },
+                inset: dp(INSET).to_pixels(window.rem_size()),
+                height: self.scroll.bounds().size.height,
+                line: self.line_height(window),
+            }
+        });
+        let motion = &mut self.tile_motion;
+        if motion.previous.is_none() && motion.entering.is_empty() && motion.departing.is_empty() {
+            return;
+        }
+        if motion
+            .last_frame
+            .replace(now)
+            .is_some_and(|frame| now - frame >= motion::DURATION)
+        {
+            motion.entering.clear();
+            motion.departing.clear();
+        }
+        if motion::reduced() {
+            motion.previous = None;
+            motion.entering.clear();
+            motion.departing.clear();
+            return;
+        }
+        if motion.previous.is_none() && self.view == View::Tiles {
+            for tile in &mut motion.departing {
+                tile.position += offset - motion.offset;
+            }
+        }
+        motion.offset = offset;
+        if let Some(mut previous) = motion.previous.take()
+            && now - previous.changed < motion::DURATION
+        {
+            let mut added = HashSet::new();
+            let mut still_present = HashSet::new();
+            if let Some(viewport) = &motion.viewport {
+                added.extend(
+                    viewport
+                        .visible(offset, self.entries.len())
+                        .map(|index| &self.entries[self.order[index]].path),
+                );
+                if let Some(old) = previous.entries.take() {
+                    for entry in old.iter() {
+                        if added.is_empty() {
+                            break;
+                        }
+                        added.remove(&entry.path);
+                    }
+                }
+                let mut candidates: HashSet<_> = previous
+                    .visible
+                    .iter()
+                    .chain(&motion.departing)
+                    .map(|tile| &tile.entry.path)
+                    .collect();
+                for entry in self.entries.iter() {
+                    if candidates.is_empty() {
+                        break;
+                    }
+                    if candidates.remove(&entry.path) {
+                        still_present.insert(&entry.path);
+                    }
+                }
+                previous
+                    .visible
+                    .retain(|tile| !still_present.contains(&tile.entry.path));
+            }
+            for mut tile in previous.visible {
+                if let Some(presence) = motion.entering.remove(&tile.entry.path) {
+                    tile.presence = presence;
+                }
+                tile.presence.set(false);
+                motion.departing.push(tile);
+            }
+            motion.departing.retain_mut(|tile| {
+                if added.remove(&tile.entry.path) {
+                    let mut presence = std::mem::replace(&mut tile.presence, Presence::new(false));
+                    presence.set(true);
+                    motion.entering.insert(tile.entry.path.clone(), presence);
+                    false
+                } else {
+                    !still_present.contains(&tile.entry.path)
+                }
+            });
+            for path in added {
+                motion.entering.entry(path.clone()).or_insert_with(|| {
+                    let mut presence = Presence::new(false);
+                    presence.set(true);
+                    presence
+                });
+            }
+        }
+        motion
+            .entering
+            .retain(|_, presence| presence.advance(now, false));
+        motion
+            .departing
+            .retain_mut(|tile| tile.presence.advance(now, false));
+        if !motion.entering.is_empty() || !motion.departing.is_empty() {
+            window.request_animation_frame();
+        }
+    }
+}
+
+fn tile_travel(amount: f32) -> f32 {
+    6. * (1. - amount)
 }
 
 /// A name on up to two lines of `width`: broken where it would wrap, with
@@ -1990,6 +2335,39 @@ fn name_lines(
     let second = SharedString::from(name[split..].trim_start().to_owned());
     let second = wrapper.truncate_line(second, width, "…", &mut Vec::new());
     (name[..split].trim_end().to_owned().into(), Some(second))
+}
+
+fn tile_icon() -> gpui::Div {
+    div()
+        .size(dp(TILE_ICON + 10.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(dp(radius::MD))
+}
+
+fn tile_name(
+    entry: &FileEntry,
+    width: Pixels,
+    names: &mut gpui::LineWrapper,
+    selected: bool,
+    carried: bool,
+) -> gpui::Div {
+    let (first, second) = name_lines(&entry.name, width, names);
+    div()
+        .flex()
+        .flex_col()
+        .items_center()
+        .px(dp(5.))
+        .rounded(dp(radius::XS))
+        .text_size(dp(text_size::DETAIL))
+        .whitespace_nowrap()
+        .when(carried, |name| name.bg(rgb(0x303030)))
+        .when(selected && !carried, |name| {
+            name.bg(rgb(0x174b78)).text_color(rgb(0xffffff))
+        })
+        .child(first)
+        .children(second)
 }
 
 /// One line of tiles: large icons or thumbnails, each named beneath. As in
@@ -2015,6 +2393,7 @@ fn tile_line(
             let carried = selected && this.dragging_out.is_some();
             div()
                 .id(("tile", index))
+                .on_any_mouse_down(this.item_mouse_down(index, list.clone()))
                 .group("tile")
                 .flex_shrink_0()
                 .w(tiles.width)
@@ -2024,14 +2403,16 @@ fn tile_line(
                 .items_center()
                 .pt(dp(6.))
                 .gap(dp(4.))
+                .when_some(
+                    this.tile_motion.entering.get(&entry.path),
+                    |tile, presence| {
+                        let amount = presence.value();
+                        tile.relative().top(dp(tile_travel(amount))).opacity(amount)
+                    },
+                )
                 .child(
-                    div()
+                    tile_icon()
                         .id(("tile-icon", index))
-                        .size(dp(TILE_ICON + 10.))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded(dp(radius::MD))
                         .when(selected, |icon| icon.bg(rgb(0x303030)))
                         .when(!selected, |icon| {
                             icon.group_hover("tile", |icon| icon.bg(rgb(0x1b2026)))
@@ -2052,23 +2433,7 @@ fn tile_line(
                     Some(renaming) if renaming.path == entry.path => {
                         rename_field(renaming).w(tiles.name_width)
                     }
-                    _ => {
-                        let (first, second) = name_lines(&entry.name, tiles.name_width, names);
-                        div()
-                            .flex()
-                            .flex_col()
-                            .items_center()
-                            .px(dp(5.))
-                            .rounded(dp(radius::XS))
-                            .text_size(dp(text_size::DETAIL))
-                            .whitespace_nowrap()
-                            .when(carried, |name| name.bg(rgb(0x303030)))
-                            .when(selected && !carried, |name| {
-                                name.bg(rgb(0x174b78)).text_color(rgb(0xffffff))
-                            })
-                            .child(first)
-                            .children(second)
-                    }
+                    _ => tile_name(entry, tiles.name_width, names, selected, carried),
                 })
         }))
 }
@@ -2094,4 +2459,21 @@ fn arrow_selection(
         _ => target,
     };
     Some((anchor.min(target)..anchor.max(target) + 1, anchor, target))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_pressed_item_follows_its_file_through_a_refresh() {
+        let entries = entries_for_paths(vec!["a".into(), "b".into(), "c".into()]);
+        let pressed = DisplayedItem {
+            row: 1,
+            path: entries[1].path.clone(),
+        };
+        assert_eq!(pressed.resolve(&entries, &[0, 1, 2]), Some(1));
+        assert_eq!(pressed.resolve(&entries, &[1, 2, 0]), Some(0));
+        assert_eq!(pressed.resolve(&entries, &[0, 2]), None);
+    }
 }

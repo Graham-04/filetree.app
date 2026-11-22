@@ -310,7 +310,7 @@ pub(super) fn eject(path: &Path) -> Result<()> {
     Ok(())
 }
 
-unsafe fn string(value: id) -> Option<String> {
+pub(super) unsafe fn string(value: id) -> Option<String> {
     if value == nil {
         return None;
     }

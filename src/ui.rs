@@ -33,6 +33,27 @@ pub(super) mod radius {
     pub const LG: f32 = 12.;
 }
 
+pub(super) const CLOSE_BUTTON_SIZE: f32 = 20.;
+
+pub(super) fn close_icon() -> impl gpui::IntoElement {
+    crate::native_icons::symbol("xmark", 10.)
+}
+
+pub(super) fn close_button(id: impl Into<gpui::ElementId>) -> gpui::Stateful<gpui::Div> {
+    use gpui::{div, prelude::*, rgb};
+    div()
+        .id(id)
+        .size(dp(CLOSE_BUTTON_SIZE))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(dp(radius::SM))
+        .hover(|button| button.bg(rgb(0x424242)))
+        .cursor_pointer()
+        .child(close_icon())
+}
+
 /// The system alert sound, for an action that could not be done.
 pub(super) fn beep() {
     #[link(name = "AppKit", kind = "framework")]
@@ -173,13 +194,14 @@ pub(super) fn spinner(started: Instant, size: f32) -> impl gpui::IntoElement {
 
 /// Builds a tooltip showing `text`, for `StatefulInteractiveElement::tooltip`.
 pub(super) fn tooltip(
-    text: &'static str,
+    text: impl Into<gpui::SharedString>,
 ) -> impl Fn(&mut Window, &mut gpui::App) -> gpui::AnyView + 'static {
-    move |_, cx| gpui::AppContext::new(cx, |_| Tooltip(text)).into()
+    let text = text.into();
+    move |_, cx| gpui::AppContext::new(cx, |_| Tooltip(text.clone())).into()
 }
 
 /// A small elevated note that wraps to a readable width.
-struct Tooltip(&'static str);
+struct Tooltip(gpui::SharedString);
 
 impl gpui::Render for Tooltip {
     fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl gpui::IntoElement {
@@ -197,7 +219,7 @@ impl gpui::Render for Tooltip {
             .text_size(dp(text_size::DETAIL))
             .line_height(dp(17.))
             .text_color(rgb(0xeeeeee))
-            .child(self.0)
+            .child(self.0.clone())
     }
 }
 

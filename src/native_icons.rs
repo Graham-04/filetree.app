@@ -580,7 +580,6 @@ impl Asset for IconRaster {
 fn rasterize(source: &Source, pixels: u32, points: f32) -> anyhow::Result<Arc<RenderImage>> {
     // SAFETY: called on the application's main thread. The autorelease pool
     // owns temporary AppKit objects, and bitmap bytes are copied before it drains.
-    // The bitmap is explicitly allocated as non-planar, 8-bit RGBA.
     unsafe {
         let _pool = StrongPtr::new(msg_send![class!(NSAutoreleasePool), new]);
         let image: id = match source {
@@ -652,7 +651,19 @@ fn rasterize(source: &Source, pixels: u32, points: f32) -> anyhow::Result<Arc<Re
                 image
             }
         };
+        rasterize_image(image, pixels)
+    }
+}
 
+/// Draws an NSImage in a square while preserving its aspect ratio.
+///
+/// SAFETY: Run on the AppKit thread with an autorelease pool. The image must
+/// remain live for the call, or be nil.
+pub(super) unsafe fn rasterize_image(image: id, pixels: u32) -> anyhow::Result<Arc<RenderImage>> {
+    anyhow::ensure!(image != nil, "No native icon");
+    // SAFETY: The caller keeps the image live. The non-planar 8-bit RGBA
+    // bitmap owns its buffer until the bytes have been copied out.
+    unsafe {
         let space = StrongPtr::new(NSString::alloc(nil).init_str("NSDeviceRGBColorSpace"));
         let bitmap: id = msg_send![class!(NSBitmapImageRep), alloc];
         let bitmap = StrongPtr::new(msg_send![bitmap,

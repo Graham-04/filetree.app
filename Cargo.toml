@@ -1,7 +1,10 @@
 [package]
 name = "filetree"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
+
+[features]
+dev-tools = []
 
 [dependencies]
 gpui = { version = "=0.2.2", default-features = false, features = ["font-kit"] }

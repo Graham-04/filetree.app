@@ -152,8 +152,13 @@ impl SearchInput {
     }
 
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_to(0, cx);
-        self.select_to(self.content.len(), cx)
+        self.select_entire_field(cx);
+    }
+
+    fn select_entire_field(&mut self, cx: &mut Context<Self>) {
+        self.selected_range = 0..self.content.len();
+        self.selection_reversed = false;
+        cx.notify();
     }
 
     fn home(&mut self, _: &Home, _: &mut Window, cx: &mut Context<Self>) {
@@ -214,6 +219,11 @@ impl SearchInput {
         cx: &mut Context<Self>,
     ) {
         self.focus_handle.focus(window);
+        if event.click_count >= 2 && !event.modifiers.shift {
+            self.is_selecting = false;
+            self.select_entire_field(cx);
+            return;
+        }
         self.is_selecting = true;
 
         if event.modifiers.shift {

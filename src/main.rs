@@ -14,29 +14,35 @@ use gpui::{
     Window, WindowBounds, WindowOptions, actions, div, prelude::*, px, rgb, size,
 };
 
+mod context_menu;
 mod drag_out;
 mod file_list;
 mod file_ops;
+mod file_tags;
 mod file_viewer;
 mod folder_cache;
 mod history;
+mod native_file_menu;
 mod native_icons;
 mod panes;
 mod path_completion;
 mod quick_look;
 use file_list::{FileEntry, FileList};
+mod motion;
 mod search_index;
 mod search_input;
 mod settings;
 mod sidebar;
 mod storage;
 mod system;
+mod transfers;
 mod ui;
 mod undo;
 mod updater;
 mod watcher;
 mod window_chrome;
 
+use context_menu::ContextMenu;
 use ui::{chrome, dp, radius, row, text_size};
 
 /// Titlebar search widths in unzoomed points.
@@ -69,6 +75,7 @@ actions!(
         ZoomOut,
         ResetZoom,
         ToggleCommandMenu,
+        CloseTransfers,
         ToggleSettings,
         MakeDefaultFileManager,
         ToggleHiddenFiles,
@@ -97,6 +104,8 @@ actions!(
         ContextMenuPrevious,
         ContextMenuNext,
         ContextMenuRun,
+        ContextMenuRight,
+        ContextMenuLeft,
         CloseContextMenu,
         MenuOpen,
         MenuQuickLook,
@@ -137,6 +146,9 @@ actions!(
     ]
 );
 
+#[cfg(any(debug_assertions, feature = "dev-tools"))]
+actions!(filetree, [SimulateFileTransfers]);
+
 struct BrowserTab {
     id: u64,
     location: PathBuf,
@@ -154,6 +166,7 @@ struct BrowserTab {
 /// it, arranged by `layout`; each keeps its own folder, history, search, and
 /// selection, and the focused one is the active tab.
 struct Group {
+    id: u64,
     layout: panes::Layout<u64>,
     /// The pane focused last, which the tab is named for and returns to.
     focus: u64,
@@ -234,6 +247,8 @@ enum Command {
     MovePaneToTab,
     ResetZoom,
     ClearIndex,
+    #[cfg(any(debug_assertions, feature = "dev-tools"))]
+    SimulateTransfers,
 }
 impl Command {
     fn label(self) -> &'static str {
@@ -251,6 +266,8 @@ impl Command {
             Self::MovePaneToTab => "Move Pane to New Tab",
             Self::ResetZoom => "Reset to Default Zoom",
             Self::ClearIndex => "Clear File Index",
+            #[cfg(any(debug_assertions, feature = "dev-tools"))]
+            Self::SimulateTransfers => "Simulate 3 File Transfers",
         }
     }
     fn shortcut(self) -> Option<&'static str> {
@@ -264,6 +281,8 @@ impl Command {
             Self::SplitDown | Self::MovePaneToTab => None,
             Self::ResetZoom => Some("⌘0"),
             Self::ClearIndex => None,
+            #[cfg(any(debug_assertions, feature = "dev-tools"))]
+            Self::SimulateTransfers => None,
         }
     }
     fn icon(self) -> &'static str {
@@ -281,6 +300,8 @@ impl Command {
             Self::MovePaneToTab => "macwindow.badge.plus",
             Self::ResetZoom => "arrow.counterclockwise",
             Self::ClearIndex => "trash",
+            #[cfg(any(debug_assertions, feature = "dev-tools"))]
+            Self::SimulateTransfers => "arrow.up.arrow.down",
         }
     }
     fn action(self) -> Box<dyn gpui::Action> {
@@ -298,6 +319,8 @@ impl Command {
             Self::MovePaneToTab => Box::new(MovePaneToTab),
             Self::ResetZoom => Box::new(ResetZoom),
             Self::ClearIndex => Box::new(ClearFileIndex),
+            #[cfg(any(debug_assertions, feature = "dev-tools"))]
+            Self::SimulateTransfers => Box::new(SimulateFileTransfers),
         }
     }
 }
@@ -324,6 +347,8 @@ fn matching_commands(query: &str, updates: bool, in_panes: bool) -> Vec<Command>
         Command::MovePaneToTab,
         Command::ResetZoom,
         Command::ClearIndex,
+        #[cfg(any(debug_assertions, feature = "dev-tools"))]
+        Command::SimulateTransfers,
     ]
     .into_iter()
     .filter(|command| updates || !matches!(command, Command::CheckForUpdates))
@@ -345,6 +370,10 @@ fn matching_commands(query: &str, updates: bool, in_panes: bool) -> Vec<Command>
             Command::MovePaneToTab => "move pane to new tab separate split unsplit detach",
             Command::ResetZoom => "reset to default zoom appearance 100%",
             Command::ClearIndex => "clear file index fsearch rebuild cache search",
+            #[cfg(any(debug_assertions, feature = "dev-tools"))]
+            Command::SimulateTransfers => {
+                "simulate 3 file transfers preview demo mock copy move progress"
+            }
         };
         query
             .split_whitespace()
@@ -392,6 +421,8 @@ struct FileBrowser {
     tabs: Vec<BrowserTab>,
     active_tab: usize,
     tab_scroll: ScrollHandle,
+    tab_strip: motion::TabStrip,
+    presented_panes: Vec<u64>,
     /// The command menu's list, scrolled to keep the selection in view.
     command_scroll: ScrollHandle,
     /// Tabs of several panes, each shown as one tab in the tab bar.
@@ -418,6 +449,7 @@ struct FileBrowser {
     path_edit: Option<PathEdit>,
     /// Undo and redo for file changes, for the session.
     undo: undo::UndoHistory,
+    transfers: transfers::Transfers,
     /// An undo or redo is running; the next waits for it.
     reverting: bool,
     settings_open: bool,
@@ -579,6 +611,8 @@ impl FileBrowser {
             }],
             active_tab: 0,
             tab_scroll: ScrollHandle::new(),
+            tab_strip: Default::default(),
+            presented_panes: Vec::new(),
             command_scroll: ScrollHandle::new(),
             groups: Vec::new(),
             resizing_split: None,
@@ -595,6 +629,7 @@ impl FileBrowser {
             path_input,
             path_edit: None,
             undo: Default::default(),
+            transfers: Default::default(),
             reverting: false,
             settings_open: false,
             default_file_manager: file_viewer::DefaultStatus::Unavailable,
@@ -633,9 +668,11 @@ impl FileBrowser {
                 && panes.iter().all(|&pane| browser.group_of(pane).is_none())
             {
                 browser.groups.push(Group {
+                    id: browser.next_tab_id,
                     focus: panes[0],
                     layout,
                 });
+                browser.next_tab_id += 1;
             }
         }
         browser._session_hooks = vec![
@@ -1431,7 +1468,11 @@ impl FileBrowser {
         let group = match self.group_of(target) {
             Some(group) => group,
             None => {
+                let id = self.next_tab_id;
+                self.next_tab_id += 1;
+                self.tab_strip.rekey(target, id);
                 self.groups.push(Group {
+                    id,
                     layout: panes::Layout::Pane(target),
                     focus: target,
                 });
@@ -1456,6 +1497,9 @@ impl FileBrowser {
         layout.remove(id);
         let panes = layout.panes();
         if panes.len() < 2 {
+            if let Some(&survivor) = panes.first() {
+                self.tab_strip.rekey(self.groups[group].id, survivor);
+            }
             self.groups.remove(group);
         } else if self.groups[group].focus == id {
             self.groups[group].focus = panes[0];
@@ -1581,23 +1625,24 @@ impl FileBrowser {
                 .detach();
             }
             Request::ContextMenu { position, paths } => {
-                self.context_menu = Some(ContextMenu {
-                    position: *position,
-                    paths: paths.clone(),
-                    selected: None,
-                    can_paste: !system::pasted_files().is_empty(),
-                    open_with: None,
-                    sidebar: None,
-                });
-                // The menu takes the keyboard until it closes.
-                self.focus.focus(window);
-                cx.notify();
+                let menu = ContextMenu::new(
+                    *position,
+                    paths.clone(),
+                    paths.len() == 1 && file_list::is_package(&paths[0]),
+                    !system::pasted_files().is_empty(),
+                    None,
+                );
+                self.show_context_menu(menu, window, cx);
             }
         }
     }
 
     fn run_file_action(&mut self, action: FileAction, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(menu) = self.context_menu.take() else {
+        if action.expands() {
+            self.open_context_submenu(action, true, cx);
+            return;
+        }
+        let Some(menu) = self.take_context_menu(window, cx) else {
             return;
         };
         self.focus_list(window, cx);
@@ -1615,8 +1660,12 @@ impl FileBrowser {
                     self.open_recent(path.clone(), window, cx);
                 }
             }
-            // Enter on Open With opens with the default app.
-            FileAction::Open | FileAction::OpenWith => self.open_paths(&menu.paths, window, cx),
+            FileAction::Open => self.open_paths(&menu.paths, window, cx),
+            FileAction::ShowPackageContents => {
+                if let Some(path) = menu.paths.first() {
+                    self.navigate(path.clone(), window, cx);
+                }
+            }
             FileAction::OpenInNewTab => {
                 if let Some(path) = menu.paths.first() {
                     self.open_tab(path.clone(), window, cx);
@@ -1640,6 +1689,15 @@ impl FileBrowser {
                 }
             }
             FileAction::Duplicate => self.duplicate(menu.paths, cx),
+            FileAction::GetInfo => self.show_file_info(menu.paths, menu.package, window, cx),
+            FileAction::Compress | FileAction::MakeAlias => {
+                self.create_file_outputs(action, menu.paths, window, cx)
+            }
+            FileAction::OpenWith
+            | FileAction::Share
+            | FileAction::Tags
+            | FileAction::QuickActions
+            | FileAction::Services => unreachable!("expanded above"),
             FileAction::Copy => system::copy_files(&menu.paths),
             FileAction::CopyPath => self.copy_paths(&targets, cx),
             FileAction::Paste => self.paste(file_ops::Transfer::Copy, cx),
@@ -1648,6 +1706,67 @@ impl FileBrowser {
             FileAction::NewFolder => self.new_folder(list, window, cx),
         }
         cx.notify();
+    }
+
+    fn show_file_info(
+        &self,
+        paths: Vec<PathBuf>,
+        package: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let worker = cx.background_executor().clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let info = worker
+                .spawn(async move { file_info(&paths, package) })
+                .await;
+            let _ = this.update_in(cx, |_, window, cx| match info {
+                Ok(detail) => {
+                    drop(window.prompt(PromptLevel::Info, "Get Info", Some(&detail), &["OK"], cx))
+                }
+                Err(error) => show_file_action_error("Get Info", &error, window, cx),
+            });
+        })
+        .detach();
+    }
+
+    fn create_file_outputs(
+        &mut self,
+        action: FileAction,
+        paths: Vec<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let worker = cx.background_executor().clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let (created, error) = worker
+                .spawn(async move {
+                    let mut created = Vec::new();
+                    let result = if action == FileAction::Compress {
+                        file_ops::compress(&paths).map(|path| created.push(path))
+                    } else {
+                        paths.iter().try_for_each(|path| {
+                            file_ops::make_alias(path).map(|alias| created.push(alias))
+                        })
+                    };
+                    (created, result.err())
+                })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                let folders: Vec<_> = created
+                    .iter()
+                    .filter_map(|path| path.parent().map(Path::to_path_buf))
+                    .collect();
+                this.undo.record(undo::Change::new(
+                    created.into_iter().map(undo::Step::Placed).collect(),
+                ));
+                this.refresh_folders(&folders, cx);
+                if let Some(error) = error {
+                    show_file_action_error(action.label(), &error, window, cx);
+                }
+            });
+        })
+        .detach();
     }
 
     /// Runs `action` from its shortcut if the open menu offers it.
@@ -1661,8 +1780,31 @@ impl FileBrowser {
         }
     }
 
+    fn take_context_menu(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<ContextMenu> {
+        let mut menu = self.context_menu.take()?;
+        menu.release_share_icons(window, cx);
+        Some(menu)
+    }
+
+    fn show_context_menu(
+        &mut self,
+        menu: ContextMenu,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        drop(self.take_context_menu(window, cx));
+        self.context_menu = Some(menu);
+        // The menu takes the keyboard until it closes.
+        self.focus.focus(window);
+        cx.notify();
+    }
+
     fn close_context_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.context_menu.take().is_some() {
+        if self.take_context_menu(window, cx).is_some() {
             self.focus_list(window, cx);
             cx.notify();
         }
@@ -1677,53 +1819,13 @@ impl FileBrowser {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.context_menu = Some(ContextMenu {
-            position,
-            sidebar: Some((place, path.is_dir())),
-            paths: vec![path],
-            selected: None,
-            can_paste: false,
-            open_with: None,
-        });
-        // The menu takes the keyboard until it closes.
-        self.focus.focus(window);
-        cx.notify();
-    }
-
-    /// Shows the Open With submenu, finding the apps once per menu.
-    fn show_open_with(&mut self, cx: &mut Context<Self>) {
-        let Some(menu) = &mut self.context_menu else {
-            return;
-        };
-        if menu.open_with.is_some() {
-            return;
-        }
-        let apps = menu
-            .paths
-            .first()
-            .map(|path| system::apps_for(path))
-            .unwrap_or_default();
-        menu.open_with = Some(
-            apps.into_iter()
-                .map(|app| {
-                    let icon = classify(&app.path);
-                    (app, icon)
-                })
-                .collect(),
-        );
-        cx.notify();
-    }
-
-    fn hide_open_with(&mut self, cx: &mut Context<Self>) {
-        if let Some(menu) = &mut self.context_menu
-            && menu.open_with.take().is_some()
-        {
-            cx.notify();
-        }
+        let folder = path.is_dir();
+        let menu = ContextMenu::new(position, vec![path], false, false, Some((place, folder)));
+        self.show_context_menu(menu, window, cx);
     }
 
     fn open_with(&mut self, app: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(menu) = self.context_menu.take() else {
+        let Some(menu) = self.take_context_menu(window, cx) else {
             return;
         };
         self.focus_list(window, cx);
@@ -1909,22 +2011,64 @@ impl FileBrowser {
             );
             changed.push(folder.clone());
         }
+        let items: Vec<_> = jobs
+            .into_iter()
+            .flat_map(|(paths, folder)| {
+                paths
+                    .into_iter()
+                    .map(move |path| Arc::new(transfers::Item::new(path, folder.clone())))
+            })
+            .collect();
+        if items.is_empty() {
+            return;
+        }
+        let batch = self.transfers.start(items.clone());
         let worker = cx.background_executor().clone();
         cx.spawn(async move |this, cx| {
-            let (placed, error) = worker
-                .spawn(async move {
-                    let mut placed = Vec::new();
-                    for (paths, folder) in jobs {
-                        let (done, error) = file_ops::transfer(&paths, &folder, mode);
-                        placed.extend(done);
-                        if error.is_some() {
-                            return (placed, error);
+            let mut task = worker.spawn(async move {
+                use transfers::Status;
+
+                let mut placed = Vec::new();
+                let mut error = None;
+                for item in items {
+                    if error.is_some() {
+                        item.finish(Status::Skipped);
+                        continue;
+                    }
+                    match file_ops::transfer(&item, mode) {
+                        Ok(Some(entry)) => {
+                            placed.push(entry);
+                            item.finish(Status::Done);
+                        }
+                        Ok(None) => {
+                            item.finish(Status::Skipped);
+                        }
+                        Err(failure) => {
+                            if item.finish(Status::Failed(format!("{failure:#}"))) {
+                                error = Some(failure);
+                            }
                         }
                     }
-                    (placed, None)
-                })
-                .await;
+                }
+                (placed, error)
+            });
+            let (placed, error) = loop {
+                use futures::future::{Either, select};
+
+                match select(task, worker.timer(Duration::from_millis(100))).await {
+                    Either::Left((result, _)) => break result,
+                    Either::Right(((), pending)) => {
+                        task = pending;
+                        let _ = this.update(cx, |this, cx| {
+                            if this.transfers.visible() {
+                                cx.notify();
+                            }
+                        });
+                    }
+                }
+            };
             let _ = this.update(cx, |this, cx| {
+                this.transfers.finish(batch, error.is_some());
                 // Nothing moved, such as a drop where the items already are,
                 // stays silent.
                 if !placed.is_empty() {
@@ -1939,6 +2083,7 @@ impl FileBrowser {
                     ui::beep();
                 }
                 this.refresh_folders(&changed, cx);
+                cx.notify();
             });
         })
         .detach();
@@ -2053,6 +2198,27 @@ impl FileBrowser {
                 || (searching && stale_index && !self.index.covers(&current.location))
             {
                 self.refresh_tab_inner(tab, true, cx);
+            }
+        }
+    }
+
+    /// Tag changes affect folder listings and any search that shows the files.
+    fn refresh_tagged_items(&mut self, changed: &[PathBuf], cx: &mut Context<Self>) {
+        let folders: std::collections::HashSet<_> =
+            changed.iter().filter_map(|path| path.parent()).collect();
+        for folder in &folders {
+            self.folders.remove(folder);
+        }
+        let paths = changed.iter().map(PathBuf::as_path).collect();
+        for index in 0..self.tabs.len() {
+            let tab = &self.tabs[index];
+            let affected = if tab.query.trim().is_empty() {
+                folders.contains(tab.location.as_path())
+            } else {
+                tab.loading || tab.list.read(cx).contains_paths(&paths)
+            };
+            if affected {
+                self.refresh_tab_inner(index, true, cx);
             }
         }
     }
@@ -2394,13 +2560,25 @@ impl FileBrowser {
     /// own path bar. Clicking a pane focuses it; dragging a line between panes
     /// resizes them; dragging a tab over a pane offers to add it there, on
     /// the side nearest the pointer.
-    fn panes(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn panes(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let active = self.tabs[self.active_tab].id;
         let group = self.group_of(active);
         let layout = match group {
             Some(group) => self.groups[group].layout.clone(),
             None => panes::Layout::Pane(active),
         };
+        let shown = layout.panes();
+        for &id in &self.presented_panes {
+            if !shown.contains(&id)
+                && let Some(index) = self.tab_index(id)
+            {
+                self.tabs[index].list.update(cx, |list, cx| {
+                    list.hide_tile_motion();
+                    cx.notify();
+                });
+            }
+        }
+        self.presented_panes = shown;
         if let Some((path, axis)) = self.resizing_split.clone() {
             let browser = cx.entity();
             window.on_mouse_event({
@@ -2797,12 +2975,17 @@ impl FileBrowser {
     /// Rows or tiles, at the right end of the top right pane's path bar.
     fn view_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let view = |view: storage::View, symbol: &'static str, tip: &'static str| {
-            path_bar_button(tip, symbol, self.settings.view == view, true).on_click(cx.listener(
-                move |this, _, window, cx| {
-                    cx.stop_propagation();
-                    this.set_view(view, window, cx);
-                },
-            ))
+            path_bar_button(
+                tip,
+                native_icons::symbol(symbol, 14.),
+                self.settings.view == view,
+                true,
+            )
+            .tooltip(ui::tooltip(tip))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                cx.stop_propagation();
+                this.set_view(view, window, cx);
+            }))
         };
         div()
             .flex()
@@ -2826,12 +3009,14 @@ impl FileBrowser {
         let group = self.group_of(id);
         let room = group.is_none_or(|group| self.groups[group].layout.panes().len() < panes::LIMIT);
         let split = |tip: &'static str, symbol: &'static str, side: panes::Side| {
-            path_bar_button(tip, symbol, false, room).when(room, |button| {
-                button.on_click(cx.listener(move |this, _, window, cx| {
-                    cx.stop_propagation();
-                    this.split_pane(side, window, cx);
-                }))
-            })
+            path_bar_button(tip, native_icons::symbol(symbol, 14.), false, room)
+                .tooltip(ui::tooltip(tip))
+                .when(room, |button| {
+                    button.on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.split_pane(side, window, cx);
+                    }))
+                })
         };
         div()
             .flex()
@@ -2851,12 +3036,12 @@ impl FileBrowser {
             ))
             .when(group.is_some(), |controls| {
                 controls.child(
-                    path_bar_button("Close Pane", "xmark", false, true).on_click(cx.listener(
-                        move |this, _, window, cx| {
+                    path_bar_button("Close Pane", close_pane_icon(), false, true).on_click(
+                        cx.listener(move |this, _, window, cx| {
                             cx.stop_propagation();
                             this.close_tab(tab_index, window, cx);
-                        },
-                    )),
+                        }),
+                    ),
                 )
             })
     }
@@ -3053,6 +3238,18 @@ impl FileBrowser {
         cx.notify();
     }
 
+    /// Closes the tab bar item, including every pane of a split tab.
+    fn close_tab_item(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let panes = self
+            .group_of(id)
+            .map_or_else(|| vec![id], |group| self.groups[group].layout.panes());
+        for id in panes.into_iter().rev() {
+            if let Some(index) = self.tab_index(id) {
+                self.close_tab(index, window, cx);
+            }
+        }
+    }
+
     /// The tab bar's label for a tab, or for a search in it.
     fn tab_title(&self, index: usize) -> String {
         let tab = &self.tabs[index];
@@ -3086,24 +3283,12 @@ impl FileBrowser {
         let show_close = width >= 100. || active;
         let title = self.tab_title(index);
         let target = self.tabs[index].location.clone();
-        let ids: Vec<u64> = item.iter().map(|&index| self.tabs[index].id).collect();
         let dragged = DraggedTab {
             id: first,
             title: title.clone().into(),
         };
-        div()
+        tab_chip(width, active)
             .id(("tab", first))
-            .relative()
-            .flex()
-            .flex_1()
-            .min_w(dp(36.))
-            .px(dp(4.))
-            .h_full()
-            .items_center()
-            .justify_center()
-            .rounded(dp(radius::MD))
-            .bg(rgb(if active { 0x353535 } else { 0x222222 }))
-            .text_color(rgb(if active { 0xeeeeee } else { 0xaaaaaa }))
             .cursor_pointer()
             .drag_over::<ExternalPaths>(|tab, _, _, _| tab.bg(rgb(0x1d4f7d)))
             .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
@@ -3120,48 +3305,31 @@ impl FileBrowser {
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.select_tab(index, window, cx);
             }))
-            .when(width >= 70., |tab| {
-                tab.child(
-                    div()
-                        .flex_1()
-                        .min_w(dp(0.))
-                        .text_center()
-                        .text_ellipsis()
-                        .child(title),
-                )
-            })
-            .when(width < 70. && !show_close, |tab| {
-                tab.child(div().size(dp(8.)).rounded_full().bg(rgb(0x0a84ff)))
-            })
+            .on_mouse_down(
+                MouseButton::Middle,
+                cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.close_tab_item(first, window, cx);
+                }),
+            )
+            .when(width >= 70., |tab| tab.child(tab_text(title)))
+            .when(width < 70. && !show_close, |tab| tab.child(tab_dot()))
             .when(show_close, |tab| {
-                let ids = ids.clone();
                 tab.child(
-                    div()
-                        .id(("close-tab", first))
-                        .size(dp(24.))
-                        .flex_shrink_0()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded(dp(radius::SM))
-                        .hover(|button| button.bg(rgb(0x4a4a4a)))
+                    ui::close_button(("close-tab", first))
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .on_click(cx.listener(move |this, _, window, cx| {
                             cx.stop_propagation();
-                            // A split tab closes with all of its panes.
-                            for id in ids.iter().rev() {
-                                if let Some(index) = this.tab_index(*id) {
-                                    this.close_tab(index, window, cx);
-                                }
-                            }
-                        }))
-                        .child(native_icons::symbol("xmark", 10.)),
+                            this.close_tab_item(first, window, cx);
+                        })),
                 )
             })
             // While another tab is dragged: drop on this one's left half to
             // put it before, on the right half to put it after.
             .when(
-                dragging.is_some_and(|dragged| !ids.contains(&dragged)),
+                dragging.is_some_and(|dragged| {
+                    item.iter().all(|&index| self.tabs[index].id != dragged)
+                }),
                 |tab| {
                     let half = |id: &'static str, right: bool| {
                         let before = if right { next } else { Some(first) };
@@ -3194,7 +3362,7 @@ impl FileBrowser {
     }
 
     fn tab_row(
-        &self,
+        &mut self,
         window: &Window,
         sidebar_width: f32,
         titlebar: &window_chrome::Titlebar,
@@ -3204,19 +3372,110 @@ impl FileBrowser {
         let scale = f32::from(dp(1.).to_pixels(window.rem_size()));
         let search_amount = self.search.amount(window);
         let search_width = SEARCH_CLOSED + (SEARCH_OPEN - SEARCH_CLOSED) * search_amount;
+        let transfers = self.transfers.visible();
+        let transfers_width = if transfers {
+            transfers::BUTTON_WIDTH + 4.
+        } else {
+            0.
+        };
         let available = f32::from(window.viewport_size().width)
             - sidebar_width.max(controls_width)
-            // The new-tab and search buttons, their gaps, and the right padding.
-            - (NEW_TAB + search_width + 8. + TAB_ROW_END) * scale;
-        let count = self.bar_items().len();
-        let width = ((available / scale - 4. * (count - 1) as f32) / count as f32).max(36.);
+            - (NEW_TAB + search_width + transfers_width + 8. + TAB_ROW_END) * scale;
         let items = self.bar_items();
+        let labels = items
+            .iter()
+            .map(|item| {
+                let first = self.tabs[item[0]].id;
+                motion::TabLabel {
+                    id: self
+                        .group_of(first)
+                        .map_or(first, |group| self.groups[group].id),
+                    title: self.tab_title(self.item_focus(item)),
+                    active: item.contains(&self.active_tab),
+                }
+            })
+            .collect();
+        let moving = self
+            .tab_strip
+            .update(labels, Instant::now(), motion::reduced());
+        if moving {
+            window.request_animation_frame();
+        }
+        let mut filled = 0.0_f32;
+        let slots: Vec<_> = self
+            .tab_strip
+            .slots()
+            .map(|(live, label, presence)| {
+                let gap = 4. * presence * filled.min(1.);
+                filled += presence;
+                (live, label, presence, gap)
+            })
+            .collect();
+        let gaps = slots.iter().map(|slot| slot.3).sum::<f32>();
+        let width = ((available / scale - gaps) / filled.max(1.)).max(36.);
+        if let Some(position) = slots
+            .iter()
+            .find_map(|&(live, label, presence, _)| live.filter(|_| label.active && presence < 1.))
+        {
+            // A tab entering at the far end of an overflowing strip keeps
+            // itself in view as its slot opens.
+            self.tab_scroll.scroll_to_item(position);
+        }
         // While a tab is dragged, every other item offers its edges (move
         // there) and, if it is a single tab, its middle (split with it).
         let dragging = cx
             .active_drag_value::<DraggedTab>()
             .map(|dragged| dragged.id);
         let firsts: Vec<u64> = items.iter().map(|item| self.tabs[item[0]].id).collect();
+        let mut children = Vec::with_capacity(items.len() + 1);
+        let mut leading = div().flex().flex_shrink_0().h_full();
+        let mut has_departing = false;
+        for (live, label, presence, gap) in slots {
+            let slot = div()
+                .flex_shrink_0()
+                .h_full()
+                .w(dp(width * presence))
+                .ml(dp(gap))
+                .overflow_hidden()
+                .opacity(presence);
+            if let Some(position) = live {
+                let next = firsts.get(position + 1).copied();
+                children.push(leading.child(slot.child(self.tab_item(
+                    &items[position],
+                    next,
+                    width,
+                    dragging,
+                    items.len() > 1,
+                    cx,
+                ))));
+                leading = div().flex().flex_shrink_0().h_full();
+                has_departing = false;
+            } else {
+                has_departing = true;
+                let show_close = width >= 100. || label.active;
+                leading = leading.child(
+                    slot.child(
+                        tab_chip(width, label.active)
+                            .when(width >= 70., |tab| tab.child(tab_text(label.title.clone())))
+                            .when(width < 70. && !show_close, |tab| tab.child(tab_dot()))
+                            .when(show_close, |tab| {
+                                tab.child(
+                                    div()
+                                        .size(dp(ui::CLOSE_BUTTON_SIZE))
+                                        .flex_shrink_0()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(ui::close_icon()),
+                                )
+                            }),
+                    ),
+                );
+            }
+        }
+        if has_departing {
+            children.push(leading);
+        }
         let tabs = div()
             .id("tabs")
             .text_size(dp(text_size::DETAIL))
@@ -3224,14 +3483,10 @@ impl FileBrowser {
             .flex_1()
             .min_w(dp(0.))
             .h_full()
-            .gap(dp(4.))
             .py(dp(4.))
             .overflow_x_scroll()
             .track_scroll(&self.tab_scroll)
-            .children(items.iter().enumerate().map(|(position, item)| {
-                let next = firsts.get(position + 1).copied();
-                self.tab_item(item, next, width, dragging, items.len() > 1, cx)
-            }));
+            .children(children);
         div()
             .ml(px((controls_width - sidebar_width).max(0.)))
             // Tabs, the new-tab button, and search take presses here.
@@ -3260,6 +3515,7 @@ impl FileBrowser {
                     })
                     .child(native_icons::symbol("plus", row::ICON)),
             )
+            .when(transfers, |row| row.child(self.transfers.button(cx)))
             .child(self.search_field(search_amount, cx))
     }
 
@@ -3349,227 +3605,6 @@ impl FileBrowser {
                 cx.notify();
             }
         }
-    }
-
-    fn move_context_selection(&mut self, step: isize, cx: &mut Context<Self>) {
-        let Some(menu) = &mut self.context_menu else {
-            return;
-        };
-        let count = menu.items().into_iter().flatten().count();
-        menu.selected = Some(match menu.selected {
-            None if step > 0 => 0,
-            None => count - 1,
-            Some(index) => index.saturating_add_signed(step).min(count - 1),
-        });
-        cx.notify();
-    }
-
-    /// The right-click menu at the pointer, kept inside the window. A click
-    /// anywhere else closes it.
-    fn context_menu_view(
-        &self,
-        menu: &ContextMenu,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        const WIDTH: f32 = 220.;
-        const PADDING: f32 = 4.;
-        const SEPARATOR: f32 = 9.;
-        const SUBMENU_WIDTH: f32 = 240.;
-        let items = menu.items();
-        let scale = f32::from(dp(1.).to_pixels(window.rem_size()));
-        // Where the Open With row sits, for its submenu.
-        let open_with_top = PADDING
-            + items
-                .iter()
-                .take_while(|item| **item != Some(FileAction::OpenWith))
-                .map(|item| {
-                    if item.is_some() {
-                        row::HEIGHT
-                    } else {
-                        SEPARATOR
-                    }
-                })
-                .sum::<f32>();
-        let height = PADDING * 2.
-            + items
-                .iter()
-                .map(|item| {
-                    if item.is_some() {
-                        row::HEIGHT
-                    } else {
-                        SEPARATOR
-                    }
-                })
-                .sum::<f32>();
-        let viewport = window.viewport_size();
-        let margin = 8. * scale;
-        let left = f32::from(menu.position.x)
-            .min(f32::from(viewport.width) - WIDTH * scale - margin)
-            .max(margin);
-        let top = f32::from(menu.position.y)
-            .min(f32::from(viewport.height) - height * scale - margin)
-            .max(margin);
-        let mut action_index = 0;
-        div()
-            .id("context-menu-overlay")
-            .absolute()
-            .inset_0()
-            .occlude()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, window, cx| this.close_context_menu(window, cx)),
-            )
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(|this, _, window, cx| this.close_context_menu(window, cx)),
-            )
-            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-            .child(
-                div()
-                    .id("context-menu")
-                    .absolute()
-                    .left(px(left))
-                    .top(px(top))
-                    .w(dp(WIDTH))
-                    .p(dp(PADDING))
-                    .rounded(dp(radius::MD))
-                    .bg(rgb(0x222222))
-                    .shadow_lg()
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
-                    .children(items.into_iter().map(|item| {
-                        match item {
-                            None => div()
-                                .h(dp(SEPARATOR))
-                                .flex()
-                                .items_center()
-                                .px(dp(6.))
-                                .child(div().h(px(1.)).w_full().bg(rgb(0x333333)))
-                                .into_any_element(),
-                            Some(action) => {
-                                let index = action_index;
-                                action_index += 1;
-                                div()
-                                    .id(("context-action", index))
-                                    .h(dp(row::HEIGHT))
-                                    .px(dp(10.))
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .rounded(dp(radius::SM))
-                                    .when(menu.selected == Some(index), |row| row.bg(rgb(0x303840)))
-                                    .hover(|row| row.bg(rgb(0x303840)))
-                                    .cursor_pointer()
-                                    .when(
-                                        action == FileAction::OpenWith && menu.open_with.is_some(),
-                                        |row| row.bg(rgb(0x303840)),
-                                    )
-                                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                                        if *hovered {
-                                            if action == FileAction::OpenWith {
-                                                this.show_open_with(cx);
-                                            } else {
-                                                this.hide_open_with(cx);
-                                            }
-                                        }
-                                    }))
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        cx.stop_propagation();
-                                        if action == FileAction::OpenWith {
-                                            this.show_open_with(cx);
-                                        } else {
-                                            this.run_file_action(action, window, cx);
-                                        }
-                                    }))
-                                    .child(action.label())
-                                    .when(action == FileAction::OpenWith, |row| {
-                                        row.child(native_icons::symbol("chevron.right", 10.))
-                                    })
-                                    .children(action.shortcut().map(|shortcut| {
-                                        div()
-                                            .text_size(dp(text_size::DETAIL))
-                                            .text_color(rgb(0x999999))
-                                            .child(shortcut)
-                                    }))
-                                    .into_any_element()
-                            }
-                        }
-                    })),
-            )
-            .when_some(menu.open_with.as_ref(), |overlay, apps| {
-                let rows = apps.len().max(1) as f32;
-                let height = (PADDING * 2. + rows * row::HEIGHT) * scale;
-                // To the menu's right, or its left when there is no room.
-                let right = left + (WIDTH - PADDING) * scale;
-                let sub_left =
-                    if right + SUBMENU_WIDTH * scale + margin <= f32::from(viewport.width) {
-                        right
-                    } else {
-                        (left - (SUBMENU_WIDTH - PADDING) * scale).max(margin)
-                    };
-                let sub_top = (top + (open_with_top - PADDING) * scale)
-                    .min(f32::from(viewport.height) - height - margin)
-                    .max(margin);
-                overlay.child(
-                    div()
-                        .id("open-with-menu")
-                        .absolute()
-                        .left(px(sub_left))
-                        .top(px(sub_top))
-                        .w(dp(SUBMENU_WIDTH))
-                        .p(dp(PADDING))
-                        .rounded(dp(radius::MD))
-                        .bg(rgb(0x222222))
-                        .shadow_lg()
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
-                        .when(apps.is_empty(), |submenu| {
-                            submenu.child(
-                                div()
-                                    .h(dp(row::HEIGHT))
-                                    .px(dp(10.))
-                                    .flex()
-                                    .items_center()
-                                    .text_color(rgb(0x777777))
-                                    .child("No apps"),
-                            )
-                        })
-                        .children(apps.iter().enumerate().map(|(index, (app, icon))| {
-                            let path = app.path.clone();
-                            div()
-                                .id(("open-with", index))
-                                .h(dp(row::HEIGHT))
-                                .px(dp(8.))
-                                .flex()
-                                .items_center()
-                                .gap(dp(row::GAP))
-                                .rounded(dp(radius::SM))
-                                .hover(|row| row.bg(rgb(0x303840)))
-                                .cursor_pointer()
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    cx.stop_propagation();
-                                    this.open_with(path.clone(), window, cx);
-                                }))
-                                .child(native_icons::file_icon(icon.clone(), row::ICON))
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w(dp(0.))
-                                        .text_ellipsis()
-                                        .child(app.name.clone()),
-                                )
-                                .when(app.default, |row| {
-                                    row.child(
-                                        div()
-                                            .text_size(dp(text_size::DETAIL))
-                                            .text_color(rgb(0x999999))
-                                            .child("Default"),
-                                    )
-                                })
-                        })),
-                )
-            })
     }
 
     fn command_menu(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3775,6 +3810,11 @@ impl Render for FileBrowser {
         div()
             .relative()
             .track_focus(&self.focus)
+            .when(self.transfers.open, |view| view.key_context("Transfers"))
+            .on_action(cx.listener(|this, _: &CloseTransfers, _, cx| {
+                this.transfers.close();
+                cx.notify();
+            }))
             .when(self.context_menu.is_some(), |view| {
                 view.key_context("ContextMenu")
             })
@@ -3828,7 +3868,15 @@ impl Render for FileBrowser {
             .on_action(cx.listener(|this, _: &Undo, _, cx| this.revert(true, cx)))
             .on_action(cx.listener(|this, _: &Redo, _, cx| this.revert(false, cx)))
             .on_action(cx.listener(|this, _: &CloseContextMenu, window, cx| {
-                this.close_context_menu(window, cx)
+                if !this.dismiss_context_submenu(cx) {
+                    this.close_context_menu(window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ContextMenuLeft, _, cx| {
+                this.dismiss_context_submenu(cx);
+            }))
+            .on_action(cx.listener(|this, _: &ContextMenuRight, _, cx| {
+                this.context_menu_right(cx);
             }))
             .on_action(cx.listener(|this, _: &ContextMenuPrevious, _, cx| {
                 this.move_context_selection(-1, cx)
@@ -3837,14 +3885,7 @@ impl Render for FileBrowser {
                 cx.listener(|this, _: &ContextMenuNext, _, cx| this.move_context_selection(1, cx)),
             )
             .on_action(cx.listener(|this, _: &ContextMenuRun, window, cx| {
-                let action = this.context_menu.as_ref().and_then(|menu| {
-                    let actions: Vec<FileAction> = menu.items().into_iter().flatten().collect();
-                    menu.selected.and_then(|index| actions.get(index).copied())
-                });
-                match action {
-                    Some(action) => this.run_file_action(action, window, cx),
-                    None => this.close_context_menu(window, cx),
-                }
+                this.run_context_selection(window, cx);
             }))
             .when(self.command_menu_open, |view| {
                 view.key_context("CommandMenu")
@@ -3924,6 +3965,16 @@ impl Render for FileBrowser {
                 this.focus_list(window, cx);
                 this.check_for_updates(window, cx);
             }))
+            .map(|view| {
+                #[cfg(any(debug_assertions, feature = "dev-tools"))]
+                let view =
+                    view.on_action(cx.listener(|this, _: &SimulateFileTransfers, window, cx| {
+                        this.command_menu_open = false;
+                        this.focus_list(window, cx);
+                        this.transfers.simulate(cx);
+                    }));
+                view
+            })
             .on_action(cx.listener(|this, _: &ClearFileIndex, window, cx| {
                 this.command_menu_open = false;
                 this.focus_list(window, cx);
@@ -4270,6 +4321,14 @@ impl Render for FileBrowser {
                     )
                 },
             )
+            .when(self.transfers.open, |view| {
+                view.child(self.transfers.popover(
+                    window,
+                    titlebar.height,
+                    self.search.amount(window),
+                    cx,
+                ))
+            })
             .when(self.command_menu_open, |view| {
                 view.child(self.command_menu(window, cx))
             })
@@ -4281,28 +4340,55 @@ impl Render for FileBrowser {
                 ))
             })
             .when_some(self.context_menu.as_ref(), |view, menu| {
-                view.child(self.context_menu_view(menu, window, cx))
+                view.child(context_menu::render(menu, window, cx))
             })
     }
 }
 
 /// A small icon button at a path bar's right end: shaded while `chosen`,
 /// dimmed and inert unless `enabled`.
+fn tab_chip(width: f32, active: bool) -> gpui::Div {
+    div()
+        .relative()
+        .flex()
+        .flex_shrink_0()
+        .w(dp(width))
+        .px(dp(4.))
+        .h_full()
+        .items_center()
+        .justify_center()
+        .rounded(dp(radius::MD))
+        .bg(rgb(if active { 0x353535 } else { 0x222222 }))
+        .text_color(rgb(if active { 0xeeeeee } else { 0xaaaaaa }))
+}
+
+fn tab_text(title: String) -> gpui::Div {
+    div()
+        .flex_1()
+        .min_w_0()
+        .text_center()
+        .text_ellipsis()
+        .child(title)
+}
+
+fn tab_dot() -> gpui::Div {
+    div().size(dp(8.)).rounded_full().bg(rgb(0x0a84ff))
+}
+
 fn path_bar_button(
-    tip: &'static str,
-    symbol: &'static str,
+    id: &'static str,
+    icon: impl IntoElement,
     chosen: bool,
     enabled: bool,
 ) -> gpui::Stateful<gpui::Div> {
     div()
-        .id(tip)
+        .id(id)
         .flex_shrink_0()
         .size(dp(24.))
         .flex()
         .items_center()
         .justify_center()
         .rounded(dp(radius::SM))
-        .tooltip(ui::tooltip(tip))
         .when(chosen, |button| button.bg(rgb(0x303030)))
         .when(enabled && !chosen, |button| {
             button
@@ -4310,10 +4396,33 @@ fn path_bar_button(
                 .hover(|button| button.bg(rgb(0x252525)))
         })
         .when(!enabled, |button| button.opacity(0.35))
-        .child(native_icons::symbol(
-            symbol,
-            if symbol == "xmark" { 10. } else { 14. },
-        ))
+        .child(icon)
+}
+
+/// Draws a square X at every zoom level.
+fn close_pane_icon() -> impl IntoElement {
+    use gpui::{LineCap, PathBuilder, PathStyle, StrokeOptions, canvas, point};
+
+    canvas(
+        |_, _, _| (),
+        |bounds, _, window, _| {
+            let rem = window.rem_size();
+            let half = bounds.size.width / 2. - dp(1.75).to_pixels(rem);
+            let center = bounds.center();
+            let stroke = StrokeOptions::default()
+                .with_line_width(dp(1.25).to_pixels(rem).into())
+                .with_line_cap(LineCap::Round);
+            let mut path = PathBuilder::default().with_style(PathStyle::Stroke(stroke));
+            path.move_to(point(center.x - half, center.y - half));
+            path.line_to(point(center.x + half, center.y + half));
+            path.move_to(point(center.x - half, center.y + half));
+            path.line_to(point(center.x + half, center.y - half));
+            if let Ok(path) = path.build() {
+                window.paint_path(path, rgb(0xcccccc));
+            }
+        },
+    )
+    .size(dp(10.))
 }
 
 fn file_list_view(
@@ -4331,14 +4440,18 @@ fn file_list_view(
 }
 
 /// One command in the right-click menu.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum FileAction {
     Open,
     OpenInNewTab,
     OpenWith,
+    ShowPackageContents,
     QuickLook,
+    GetInfo,
     Rename,
     Duplicate,
+    Compress,
+    MakeAlias,
     Copy,
     CopyPath,
     Paste,
@@ -4347,17 +4460,32 @@ enum FileAction {
     NewFolder,
     Eject,
     RemoveFromRecent,
+    Share,
+    Tags,
+    QuickActions,
+    Services,
 }
 
 impl FileAction {
+    fn expands(self) -> bool {
+        matches!(
+            self,
+            Self::OpenWith | Self::Share | Self::Tags | Self::QuickActions | Self::Services
+        )
+    }
+
     fn label(self) -> &'static str {
         match self {
             Self::Open => "Open",
             Self::OpenInNewTab => "Open in New Tab",
             Self::OpenWith => "Open With",
+            Self::ShowPackageContents => "Show Package Contents",
             Self::QuickLook => "Quick Look",
+            Self::GetInfo => "Get Info",
             Self::Rename => "Rename",
             Self::Duplicate => "Duplicate",
+            Self::Compress => "Compress",
+            Self::MakeAlias => "Make Alias",
             Self::Copy => "Copy",
             Self::CopyPath => "Copy Path",
             Self::Paste => "Paste",
@@ -4366,17 +4494,16 @@ impl FileAction {
             Self::NewFolder => "New Folder",
             Self::Eject => "Eject",
             Self::RemoveFromRecent => "Remove from Recent",
+            Self::Share => "Share",
+            Self::Tags => "Tags",
+            Self::QuickActions => "Quick Actions",
+            Self::Services => "Services",
         }
     }
 
     fn shortcut(self) -> Option<&'static str> {
         match self {
             Self::Open => Some("⌘↓"),
-            Self::OpenWith
-            | Self::ShowInFinder
-            | Self::OpenInNewTab
-            | Self::Eject
-            | Self::RemoveFromRecent => None,
             Self::QuickLook => Some("Space"),
             Self::Rename => Some("R"),
             Self::Duplicate => Some("⌘D"),
@@ -4385,6 +4512,7 @@ impl FileAction {
             Self::Paste => Some("⌘V"),
             Self::Trash => Some("⌘⌫"),
             Self::NewFolder => Some("⇧⌘N"),
+            _ => None,
         }
     }
 
@@ -4413,7 +4541,7 @@ impl FileAction {
     /// The menu for `paths`, `None` marking separators. Blank space (no
     /// paths) offers the current folder's actions. Paste appears only when
     /// the clipboard holds files.
-    fn menu(paths: &[PathBuf], can_paste: bool) -> Vec<Option<Self>> {
+    fn menu(paths: &[PathBuf], can_paste: bool, package: bool) -> Vec<Option<Self>> {
         if paths.is_empty() {
             let mut items = vec![Some(Self::NewFolder)];
             if can_paste {
@@ -4422,21 +4550,24 @@ impl FileAction {
             items.extend([None, Some(Self::CopyPath), Some(Self::ShowInFinder)]);
             return items;
         }
-        let mut items = vec![
-            Some(Self::Open),
-            Some(Self::OpenWith),
-            Some(Self::QuickLook),
-            None,
-        ];
+        let mut items = vec![Some(Self::Open), Some(Self::OpenWith)];
+        if package {
+            items.push(Some(Self::ShowPackageContents));
+        }
+        items.extend([Some(Self::QuickLook), None, Some(Self::GetInfo)]);
         if paths.len() == 1 {
             items.push(Some(Self::Rename));
         }
         items.extend([
             Some(Self::Duplicate),
+            Some(Self::Compress),
+            Some(Self::MakeAlias),
             Some(Self::Copy),
             Some(Self::CopyPath),
             None,
             Some(Self::ShowInFinder),
+            Some(Self::Share),
+            Some(Self::Tags),
             None,
             Some(Self::Trash),
             None,
@@ -4445,6 +4576,7 @@ impl FileAction {
         if can_paste {
             items.push(Some(Self::Paste));
         }
+        items.extend([None, Some(Self::QuickActions), Some(Self::Services)]);
         items
     }
 }
@@ -4471,29 +4603,54 @@ struct PathEdit {
     _blur: gpui::Subscription,
 }
 
-/// An open right-click menu.
-struct ContextMenu {
-    /// Where it was opened, in window coordinates.
-    position: gpui::Point<gpui::Pixels>,
-    paths: Vec<PathBuf>,
-    /// The highlighted action, once the keyboard has moved.
-    selected: Option<usize>,
-    can_paste: bool,
-    /// The Open With submenu's apps, with icons, while it is showing.
-    open_with: Option<Vec<(system::App, native_icons::FileIcon)>>,
-    /// For a sidebar item: what kind, and whether it is a folder. `None`
-    /// for files in the list.
-    sidebar: Option<(sidebar::Place, bool)>,
+fn show_file_action_error(title: &str, error: &anyhow::Error, window: &mut Window, cx: &mut App) {
+    let detail = format!("{error:#}");
+    drop(window.prompt(PromptLevel::Warning, title, Some(&detail), &["OK"], cx));
 }
 
-impl ContextMenu {
-    /// The actions offered, `None` marking separators.
-    fn items(&self) -> Vec<Option<FileAction>> {
-        match self.sidebar {
-            Some((place, folder)) => FileAction::sidebar_menu(place, folder),
-            None => FileAction::menu(&self.paths, self.can_paste),
+fn file_info(paths: &[PathBuf], package: bool) -> anyhow::Result<String> {
+    use anyhow::Context as _;
+    use std::fmt::Write as _;
+
+    let [path] = paths else {
+        let files = paths.iter().filter(|path| path.is_file()).count();
+        return Ok(format!(
+            "{} items selected\n{files} regular files",
+            paths.len()
+        ));
+    };
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("Could not read {}", path.display()))?;
+    let kind = if metadata.is_symlink() {
+        "Symbolic link"
+    } else if metadata.is_dir() && package {
+        "Package"
+    } else if metadata.is_dir() {
+        "Folder"
+    } else {
+        "File"
+    };
+    let mut info = format!("{}\n{kind}", path.display());
+    if (metadata.is_file() || metadata.is_dir())
+        && let Ok(bytes) = file_ops::item_size(path, &metadata)
+    {
+        let _ = write!(info, "\n{}", file_list::format_size(bytes));
+    }
+    if metadata.is_symlink()
+        && let Ok(target) = std::fs::read_link(path)
+    {
+        let _ = write!(info, "\nLinks to {}", target.display());
+    }
+    for (label, time) in [
+        ("Created", metadata.created()),
+        ("Modified", metadata.modified()),
+    ] {
+        if let Ok(time) = time {
+            let time: chrono::DateTime<chrono::Local> = time.into();
+            let _ = write!(info, "\n{label} {}", time.format("%b %-d, %Y at %-I:%M %p"));
         }
     }
+    Ok(info)
 }
 
 /// Clickable path components: from the home folder when inside it,
@@ -4670,6 +4827,8 @@ fn main() {
             KeyBinding::new("cmd-+", ZoomIn, None),
             KeyBinding::new("cmd-0", ResetZoom, None),
             KeyBinding::new("cmd-k", ToggleCommandMenu, None),
+            #[cfg(any(debug_assertions, feature = "dev-tools"))]
+            KeyBinding::new("cmd-p", ToggleCommandMenu, None),
             KeyBinding::new("cmd-,", ToggleSettings, None),
             // macOS reports shifted punctuation as its shifted character.
             KeyBinding::new("cmd->", ToggleHiddenFiles, None),
@@ -4689,6 +4848,7 @@ fn main() {
             KeyBinding::new("cmd-up", GoUp, None),
             KeyBinding::new("escape", CloseSearch, Some("FileSearch")),
             KeyBinding::new("escape", ToggleCommandMenu, Some("CommandMenu")),
+            KeyBinding::new("escape", CloseTransfers, Some("Transfers")),
             KeyBinding::new("escape", ToggleSettings, Some("Settings")),
             KeyBinding::new("enter", RunMenuCommand, Some("CommandMenu")),
             KeyBinding::new("up", PreviousCommand, Some("CommandMenu")),
@@ -4697,6 +4857,8 @@ fn main() {
             KeyBinding::new("up", ContextMenuPrevious, Some("ContextMenu")),
             KeyBinding::new("down", ContextMenuNext, Some("ContextMenu")),
             KeyBinding::new("enter", ContextMenuRun, Some("ContextMenu")),
+            KeyBinding::new("left", ContextMenuLeft, Some("ContextMenu")),
+            KeyBinding::new("right", ContextMenuRight, Some("ContextMenu")),
             KeyBinding::new("escape", CloseContextMenu, Some("ContextMenu")),
             KeyBinding::new("cmd-down", MenuOpen, Some("ContextMenu")),
             KeyBinding::new("space", MenuQuickLook, Some("ContextMenu")),

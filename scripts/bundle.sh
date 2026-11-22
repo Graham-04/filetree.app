@@ -24,7 +24,11 @@ export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$HOME=~ --remap-path-prefix
 # Spotlight skips folders named *.noindex, so dev builds never show up
 # beside the installed app when searching for Filetree.
 export CARGO_TARGET_DIR=target/bundle.noindex
-cargo build --release
+if [ -z "${FILETREE_UPDATE_REPOSITORY:-}" ] && [ -z "${FILETREE_RELEASE_TEAM:-}" ]; then
+    cargo build --release --features dev-tools
+else
+    cargo build --release
+fi
 binary="$CARGO_TARGET_DIR/release/filetree"
 if strings "$binary" | grep -F -q "$HOME"; then
     echo "The binary still contains $HOME; not bundling it." >&2
